@@ -95,134 +95,24 @@ void setbaud(char Mybaud);
 // When true, display extra information on the serial output.  This should be controllable by the serial input stream
 bool verbose = false;
 
-// Forward definitions of the call-back functions that we pass to the task scheduler.
-
-void read_inputs_callback();
-void print_status_callback();
-void control_battery_charger_callback();
-void control_hydraulics_callback();
-void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback();
-void monitor_position_limits_callback();
-void monitor_motor_on_time_limits_callback();
-void monitor_rs485_input_callback();
-
-/* 
- * These are the tasks that are the heart of the logic that controls this system.  Some run periodically and are always enabled.  Some run only
- * when the panels are in motion.
- */
-
-Task read_inputs(200, TASK_FOREVER, &read_inputs_callback, &ts, true);
-Task print_status(TASK_SECOND * 3, TASK_FOREVER, &print_status_callback, &ts, true);
-Task control_battery_charger(TASK_SECOND * 10, TASK_FOREVER, &control_battery_charger_callback, &ts, true);
-Task control_hydraulics(TASK_SECOND * 3, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
-Task monitor_upward_moving_panels_and_stop_when_sun_angle_correct(300, TASK_FOREVER, &monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback, &ts, false);
-Task monitor_position_limits(300, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
-Task monitor_motor_on_time_limits(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_limits_callback, &ts, true);
-Task monitor_rs485_input(100, TASK_FOREVER, &monitor_rs485_input_callback, &ts, true);
-
-
-void check_rs485(void);
-
-bool panels_going_up = false;
-bool panels_going_down = false;
-
-/*
- * Turn off both relays that drive 12VDC to the contactor inputs.  Since we aren't driving
- * the panels, we also disable the task that monitors position and estimated temperature limits
- */
-void stop_driving_panels(void)
-{
-  digitalWrite(REL1, LOW); // Turn off go-up relay
-  digitalWrite(REL2,LOW);  // Turn off go-down relay
-  panels_going_down = false;
-  panels_going_up = false;
-  monitor_position_limits.disable();
-}
-
-/*
- * Our RS-485 output is only active when we are transmitting.  Otherwise, we have this half-duplex channel
- * in a listening mode so that we can receive commands.
- */
-void enable_rs485_output()
-{
-  digitalWrite(TXEN, HIGH);   //Enable Transmit
-  delay(1);                   //Let 485 chip go into Transmit Mode
-}
-
-void disable_rs485_output()
-{
-  while (!(UCSR0A & (1 << TXC0))); 
-  digitalWrite(TXEN,LOW);               //Turn off transmit enable
-}
-
-/*
- * Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
- * error if the panels were going down when this was called.
- */
-void drive_panels_up(void)
-{
-  if (panels_going_down) {
-    enable_rs485_output();
-    Serial.println("drive_panels_up() called while panels_going_down is true");
-    stop_driving_panels();
-    delay(500);  // Give the serial link time to propogate the error message before execution ends
-    abort();
-  } else {
-    digitalWrite(REL1,HIGH); // Turn on go-up relay
-    panels_going_up = true;
-    monitor_position_limits.enable();
-  }
-}
-
-/*
- * Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
- * error if the panels were going up when this was called.
- */
-void drive_panels_down(void)
-{
-  if (panels_going_up) {
-    enable_rs485_output();
-    Serial.println("drive_panels_down() called while panels_going_up is true");
-    stop_driving_panels();
-    delay(500); // Give the serial link time to propogate the error message before execution ends
-    abort();
-  } else {
-    digitalWrite(REL2,HIGH);  // Turn on go-down relay
-    panels_going_down = true;
-    monitor_position_limits.enable();
-  }
-}
-
-bool power_supply_on = false;
-
-/*
- * Turn on the AC input of the power supply, so that we may charge our lithium battery pack.
- */
-void turn_on_power_supply(void)
-{
-  digitalWrite(REL8, HIGH);
-  power_supply_on = true;
-}
-
-/*
- * Turn off the AC input of the power supply.  We do this when the battery voltage is high enough
- * that we do not need to charge further.
- */
-void turn_off_power_supply(void)
-{
-  digitalWrite(REL8, LOW);
-  power_supply_on = false;
-}
 
 /*
  * These are values that may need to be tweaked.  They should be stored in EEPROM and changable through the RS-485
  * interface and possibly by a future keypad or other direct, at the device, interface.
  */
-unsigned position_upper_limit = 350;                     // Max position value (i.e., fully tilted up)
+unsigned position_upper_limit = 350;                          // Max position value (i.e., fully tilted up)
 unsigned position_lower_limit = 200;
-unsigned long total_on_time_limit = 300ULL * 1000ULL; // Max milliseconds driving piston up.
 unsigned long max_time_tilted_up = 10ULL * 3600ULL * 1000ULL; // Lower the panels after 10 hours, maximum.
-unsigned darkness_threshold = 200;
+unsigned darkness_threshold = 50;
+
+unsigned long supply_voltage_lower_limit = 11000;             // Below 11 volts, don't try to move panels other than lowering them.
+unsigned long supply_voltage_charge_limit_low = 12240;        // Turn on charger if voltage drops below this value
+unsigned long supply_voltage_charge_limit_high = 12300;       // Turn off charge when voltage goes over this value
+unsigned long supply_voltage_bms_open_threshold = 11000;       // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
+
+unsigned long accumulated_motor_on_time_limit = 60000;        // This is on-time in milliseconds, aged at 1/20th time
+unsigned long accumulated_motor_on_time_aging_rate = 20;      // Sets ratio of maximum on time to off time (1:<this variable>)
+
 
 /*
  * The following are global variables that are refreshed every 200 msec and availble for all tasks to 
@@ -236,9 +126,9 @@ unsigned long milliseconds;
  * These come from Arudino Analog input 1, which is driven by the center tap of two resistors that connect to the 12V line and 
  * ground.  We need this resistor divider network to move the 12V line to the range of the ADC, which is 0..5V.
  */
-unsigned supply_tap_volts_raw;  // Raw ADC value: 0..1023 for 0..5V
-unsigned long supply_tap_volts; // Raw value converted to millivolts (of the tap)
-unsigned long supply_volts;     // Tap voltage converted to supply voltage
+unsigned supply_tap_voltage_raw;  // Raw ADC value: 0..1023 for 0..5V
+unsigned long supply_tap_voltage; // Raw value converted to millivolts (of the tap)
+unsigned long supply_voltage;     // Tap voltage converted to supply voltage
 
 /*
  * These come from Arduino Analog input 2, which is driven by a TMP36 temperature sensor that is in the middle of the pack.
@@ -266,30 +156,175 @@ unsigned upper_solar_val;  // Raw ADC values 0..1023 for 0..5V
  * This is from the 1000mm pull-string sensor that tells us where the panels are.
  */
 unsigned position_sensor_val;// Raw ADC values 0..1023 for 0..5V
-  
+
+/*
+ * Record the time today when we first raised the panels.  This is used to decide, later in the day, that it must be
+ * time to lower them (in case for some reason the sun angle sensor doesn't tell us it is night time).
+ */
 unsigned long time_of_first_raise = 0ULL;
 
 /*
- * These are calculated from the values read from sensor.
+ * These are calculated from the values read from sun angle sensor.  'sun_high' means the sun is in a position that puts
+ * its rays at an angle lower than 90 degrees and naturally happens as the earth rotates during the day.  To remedy this,
+ * we move the panels up.  'sun_low' means the opposite and naturally happens when we rotate the panels past the point
+ * where the sun is at a 90 degree angle to the panels.  That's our trigger to stop moving the panels.  'dark' is when
+ * both sensors indicate the light level is so low that it must be nighttime.  That is our trigger to lower the panels to
+ * their nighttime, resting position.
  */
 bool sun_high, sun_low, dark;
 
-
 /* 
- * Calculated from 'position_sensor_val'
+ * Calculated from 'position_sensor_val' and the position limit calibration values.
  */
 bool at_upper_position_limit, at_lower_position_limit;
 
 /*
- * Set when we have spent more than 1% of the time with the motor and contactor on.
+ * Set when we have spent more than 1% of the time with the motor and contactor on.  It is our trigger to stop moving the panels.  This
+ * might happen if there is an problem where the system is trying to move the panels, but there is some failure or blockage that prevents
+ * this.
  */
 bool at_time_limit;
 
+/*
+ * The number of milliseconds the motor has been on in total, but aged (so it goes down with time that the motor is off).  This is used to 
+ * decide how much we've been running the contactor and motor.
+ */
+unsigned long accumulated_motor_on_time = 0;
 
 /*
- * The modeled temperature (based on on-times vs off-times)
+ * This is set when the accumulated motor on time is greater than its limit
  */
-unsigned long synthetic_temperature = 0;
+bool motor_might_be_hot = false;
+
+// Forward definitions of the call-back functions that we pass to the task scheduler.
+
+void read_inputs_callback();
+void print_status_callback();
+void control_battery_charger_callback();
+void control_hydraulics_callback();
+void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback();
+void monitor_position_limits_callback();
+void monitor_motor_on_time_callback();
+void monitor_rs485_input_callback();
+
+/* 
+ * These are the tasks that are the heart of the logic that controls this system.  Some run periodically and are always enabled.  Some run only
+ * when the panels are in motion.
+ */
+
+Task read_inputs(200, TASK_FOREVER, &read_inputs_callback, &ts, true);
+Task print_status(TASK_SECOND * 3, TASK_FOREVER, &print_status_callback, &ts, true);
+Task control_battery_charger(TASK_SECOND * 10, TASK_FOREVER, &control_battery_charger_callback, &ts, true);
+Task control_hydraulics(TASK_SECOND * 3, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
+Task monitor_upward_moving_panels_and_stop_when_sun_angle_correct(300, TASK_FOREVER, &monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback, &ts, false);
+Task monitor_position_limits(300, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
+Task monitor_motor_on_time(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_callback, &ts, true);
+Task monitor_rs485_input(100, TASK_FOREVER, &monitor_rs485_input_callback, &ts, true);
+
+/*
+ * Keep track of whether we are driving the panels up or down.  These two should never be true at the same time.
+ */
+bool panels_going_up = false;
+bool panels_going_down = false;
+
+/*
+ * Turn off both relays that drive 12VDC to the contactor inputs.  Since we aren't driving
+ * the panels, we also disable the task that monitors position and estimated temperature limits
+ */
+void stop_driving_panels(void)
+{
+  digitalWrite(REL1, LOW); // Turn off go-up relay
+  digitalWrite(REL2,LOW);  // Turn off go-down relay
+  panels_going_down = false;
+  panels_going_up = false;
+  monitor_position_limits.disable();
+  monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
+}
+
+/*
+ * Called by failure paths that should never happen.  When we get the RS-485 input working, we'll allow the user
+ * to do things in this case and perhaps resume operation.
+ */
+void fail(char *fail_message)
+{
+  stop_driving_panels();
+  enable_rs485_output();
+  Serial.println(fail_message);
+  delay(500); // Give the serial link time to propogate the error message before execution ends
+  abort();
+}
+
+/*
+ * Our RS-485 output is only active when we are transmitting.  Otherwise, we have this half-duplex channel
+ * in a listening mode so that we can receive commands.
+ */
+void enable_rs485_output()
+{
+  digitalWrite(TXEN, HIGH);   //Enable Transmit
+  delay(1);                   //Let 485 chip go into Transmit Mode
+}
+
+void disable_rs485_output()
+{
+  while (!(UCSR0A & (1 << TXC0))); 
+  digitalWrite(TXEN,LOW);               //Turn off transmit enable
+}
+
+/*
+ * Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
+ * error if the panels were going down when this was called.
+ */
+void drive_panels_up(void)
+{
+  if (panels_going_down) {
+    fail("drive_panels_up() called while panels_going_down is true");
+  } else {
+    digitalWrite(REL1,HIGH); // Turn on go-up relay
+    panels_going_up = true;
+    monitor_position_limits.enable();
+  }
+}
+
+/*
+ * Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
+ * error if the panels were going up when this was called.
+ */
+void drive_panels_down(void)
+{
+  if (panels_going_up) {
+    enable_rs485_output();
+    fail("drive_panels_down() called while panels_going_up is true");
+    
+  } else {
+    digitalWrite(REL2,HIGH);  // Turn on go-down relay
+    panels_going_down = true;
+    monitor_position_limits.enable();
+  }
+}
+
+/*
+ * Currently this is just used by the status tracing function.  It is true when we are calling for charging power, false when we are not.
+ */
+bool power_supply_on = false;
+
+/*
+ * Turn on the AC input of the power supply, so that we may charge our lithium battery pack.
+ */
+void turn_on_power_supply(void)
+{
+  digitalWrite(REL8, HIGH);
+  power_supply_on = true;
+}
+
+/*
+ * Turn off the AC input of the power supply.  We do this when the battery voltage is high enough
+ * that we do not need to charge further.
+ */
+void turn_off_power_supply(void)
+{
+  digitalWrite(REL8, LOW);
+  power_supply_on = false;
+}
 
 /*
  * This reads all the sensors frequently, does a little filtering of some of them, and deposits the results in global variables above.
@@ -300,17 +335,16 @@ void read_inputs_callback()
   seconds = time_now / 1000;
   milliseconds = time_now % 1000;
 
-  supply_tap_volts_raw = analogRead(ANIN4);
-  supply_tap_volts = ((unsigned long)supply_tap_volts_raw * 5036ULL) / 1023ULL;
-  supply_volts = (supply_tap_volts * 10000UL) / 3245UL;
-  
+  supply_tap_voltage_raw = analogRead(ANIN4);
 
-  if (supply_volts < 12050) {
-    // Turn on power supply to charge our batteries
-    turn_on_power_supply();
-  } else if (supply_volts > 12300) {
-    turn_off_power_supply();
-  }
+  /*
+   * The value by which we multiple the raw value, and the value we add or subtract after that are determined
+   * first by calculation based on the measured values of the resistors and then fine tuned with measurements
+   * with 5.5 digit multimeter (Rigol DM3058).
+   */
+  supply_tap_voltage = (((unsigned long)supply_tap_voltage_raw * 5036ULL) / 1023ULL) + 2;
+  supply_voltage = (supply_tap_voltage * 10000UL) / 3245UL;
+  
   battery_temperature_volts_raw = analogRead(ANIN5);
   battery_temperature_millivolts = ((battery_temperature_volts_raw * 5000ULL) / 1023) + 20 /* Calibration value */;
   battery_temperature_C_x10 = battery_temperature_millivolts - 500;
@@ -320,7 +354,10 @@ void read_inputs_callback()
   current_sense_4V_millivolts = (current_sense_4V_volts_raw * 5000ULL) / 1023;
   current_sense_4V_milliamps = (current_sense_4V_millivolts * 1000ULL) / 36600ULL;
 
-  // Average the last reading with this reading (and the 'last reading' is really the averages from before that
+  /* 
+   *  The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
+   *  have more stable values average the last reading with this reading (and the 'last reading' is a running average)
+   */
   lower_solar_val = (analogRead(ANIN1) + lower_solar_val) / 2;
   upper_solar_val = (analogRead(ANIN2) + upper_solar_val) / 2;
   position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
@@ -334,6 +371,10 @@ void read_inputs_callback()
 
 /*
  * This is the main system tracing function.  It emits a line of ASCII to the RS-485 line with lots of information.
+ * Typical:
+ * 17:39:46.312 -> [0:45] <12.135V><76F><0mA><0ST>Position: 95  Lower Solar: 45  Upper Solar: 47<Night><Sun-low><Lower-position-limit>
+ * 17:39:49.268 -> [3:0] <12.135V><75F><0mA><0ST>Position: 187  Lower Solar: 81  Upper Solar: 73<Night><Sun-low><Lower-position-limit>
+ * 17:39:52.270 -> [6:0] <12.135V><75F><0mA><0ST>Position: 178  Lower Solar: 72  Upper Solar: 71<Night><Sun-low><Lower-position-limit>
  */
 void print_status_callback()
 {
@@ -345,28 +386,23 @@ void print_status_callback()
   Serial.print("] ");
   Serial.print("<");
   if (verbose) {
-    Serial.print(supply_tap_volts_raw);
+    Serial.print(supply_tap_voltage_raw);
     Serial.print(",");
-    Serial.print(supply_tap_volts);
+    Serial.print(supply_tap_voltage);
     Serial.print(",");
   }
-  Serial.print(supply_volts / 1000);
+  Serial.print(supply_voltage / 1000);
   Serial.print(".");
-  Serial.print(supply_volts % 1000);
-  Serial.print("V>");
+  Serial.print(supply_voltage % 1000);
+  Serial.print("V><");
  
-  Serial.print("<");
-  if (verbose) {
+  if (verbose) { 
     Serial.print(battery_temperature_millivolts);
     Serial.print("VDC,");
   }
-  if (power_supply_on) {
-    Serial.print("<power supply on>");
-  }
   Serial.print(battery_temperature_F);
   Serial.print("F>");
-
-  
+ 
   Serial.print("<");
   if (verbose) {
     Serial.print(current_sense_4V_millivolts);
@@ -374,8 +410,8 @@ void print_status_callback()
   }
   Serial.print(current_sense_4V_milliamps);
   Serial.print("mA><");
-  Serial.print(synthetic_temperature);
-  Serial.print("ST>Position: ");
+  Serial.print(accumulated_motor_on_time);
+  Serial.print("msec>Position: ");
   
     Serial.print(position_sensor_val);
     
@@ -411,6 +447,12 @@ void print_status_callback()
     if (panels_going_down) {
       Serial.print("<Down>");
     }
+    if (power_supply_on) {
+      Serial.print("<power supply on>");
+    } 
+    if (motor_might_be_hot) {
+      Serial.print("<motor might be hot>");
+    }
     Serial.println("");
     disable_rs485_output();
 }
@@ -420,10 +462,34 @@ void print_status_callback()
  */
 void control_battery_charger_callback()
 {
-   if (supply_volts < 12100) {
-    // Turn on power supply to charge our batteries
-    turn_on_power_supply();
-  } else if (supply_volts > 12250) {
+  if (supply_voltage < supply_voltage_charge_limit_low) {
+
+    /*
+     * If the power supply was already on and the voltage is really low, then
+     * we conclude that the BMS opened because our charge limit range was too high. 
+     * In this case, we lower the the charge limit range unless the upper limit is 
+     * already below 12 volts.
+     */
+    if (power_supply_on && supply_voltage < supply_voltage_bms_open_threshold) {
+      if (supply_voltage_charge_limit_high > 12000) {
+        Serial.print("BMS open?  supply_voltage: ");
+        Serial.println(supply_voltage);
+
+        /*
+         * Move the charge range down 10 millivolts
+         */
+        supply_voltage_charge_limit_high -= 10;
+        supply_voltage_charge_limit_low -= 10;
+        Serial.print(" reducing supply_voltage_charge_limit_high: ");
+        Serial.print(supply_voltage_charge_limit_high);
+        Serial.print(" and supply_voltage_charge_limit_low: ");
+        Serial.print(supply_voltage_charge_limit_low);
+        turn_off_power_supply();
+      }  
+    } else {   // Turn on power supply to charge our batteries
+     turn_on_power_supply();
+    }
+  } else if (supply_voltage > supply_voltage_charge_limit_high) {
     turn_off_power_supply();
   }
 }
@@ -449,34 +515,35 @@ void monitor_position_limits_callback()
 
 /*
  * Model the temperature of the hydraulic motor and the contactor and the check valve solenoid by keeping track
- * of how long they are on vs. how long they are off. This callback doesn't directly control the motors, it runs
- * all the time doing this modeling.  Other functions use the 'synthetic_temperature' that this task/function
- * calculates to decide whether the system has been on too long.
+ * of how long they are on vs. how long they are off. This runs all the time doing this modeling.  This will stop
+ * the motor if it has run too long without time to cool down.  Other functions use the 'motor_might_be_hot' as
+ * well to decide to not start running the motor when they otherwise would.
  */
-void monitor_motor_on_time_limits_callback()
+void monitor_motor_on_time_callback()
 {
   unsigned long time_now = millis();
-  static unsigned long last_time_now = 0;
-  static bool initialized = false;
-
-  if (initialized == false) {
-    initialized = true;
-    last_time_now = time_now;
-  }
+  static unsigned long last_time_now = 0;                 // Values from millis() start at zero when system starts, so this is correct initialization vale
   unsigned long time_elapsed = time_now - last_time_now;  // Works even if we had a roll-over
+
   last_time_now = time_now;
 
   if (panels_going_up || panels_going_down) {
-    synthetic_temperature += time_elapsed;
+    accumulated_motor_on_time += time_elapsed;
   } else {
-    if (synthetic_temperature > 0) {
-      // For every second the motor is on, let it cool for 100 seconds.
-      unsigned long delta = time_elapsed / 100;
-      if (delta == 0) {
-        delta = 1;
-      }
-      synthetic_temperature -= delta;
+    // For every second the motor is on, let it cool for a number of (configurable) seconds.
+    unsigned long delta = time_elapsed / accumulated_motor_on_time_aging_rate;
+    if (accumulated_motor_on_time < delta) {
+      accumulated_motor_on_time = 0;
+    } else {
+      accumulated_motor_on_time -= delta;
     }
+  }
+  motor_might_be_hot = accumulated_motor_on_time > accumulated_motor_on_time_limit;
+  if (motor_might_be_hot && (panels_going_up || panels_going_down)) {
+    stop_driving_panels();
+    enable_rs485_output();
+    Serial.print("monitor_temperature_limit_callback(): at upper temperature limit, stopping");
+    disable_rs485_output();
   }
 }
 
@@ -488,19 +555,13 @@ void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
 {
   if (panels_going_up == false) {
     enable_rs485_output();
-    Serial.println("monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback(): panels_going_up == false");
-    delay(500);
-    abort();
+    fail("monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback(): panels_going_up == false");
   }
   if (sun_low == true) {
     stop_driving_panels();
     enable_rs485_output();
     Serial.print("monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback(): sun_low");
-
-    Serial.print(" total_on_time_limit: ");
-    Serial.println(total_on_time_limit);
     disable_rs485_output();
-    monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
   }
 }
 
@@ -514,21 +575,27 @@ void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
 void control_hydraulics_callback()
 {
   // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
-  if (sun_high && at_upper_position_limit == false && panels_going_up == false && panels_going_down == false && at_time_limit == false) {
+  bool supply_voltage_ok = supply_voltage > supply_voltage_lower_limit;
+  
+  if (sun_high && at_upper_position_limit == false && 
+    panels_going_up == false && 
+    panels_going_down == false && 
+    at_time_limit == false && 
+    supply_voltage_ok && 
+    motor_might_be_hot == false) {
     if (time_of_first_raise == 0ULL) {
       time_of_first_raise = time_now;
     }
     enable_rs485_output();
     Serial.println("  raise panels ");
     disable_rs485_output();
-    monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
     drive_panels_up();
+    monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
   } 
   unsigned long time_since_first_raise = time_now - time_of_first_raise;
   bool bedtime = (time_since_first_raise > max_time_tilted_up) || dark;
   if (panels_going_up == false && panels_going_down == false && bedtime) {
     if (at_lower_position_limit == false) {
-      // Open the check valve so that the panels can go down
       drive_panels_down();
     }
   }
@@ -561,7 +628,7 @@ void setup()
   {
     Unitaddress = 0;  
   }
-  Serial.begin(9600);
+  Serial.begin(115200);
    
   UCSR0A=UCSR0A |(1 << TXC0); //Clear Transmit Complete Flag
   enable_rs485_output();
