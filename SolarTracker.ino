@@ -14,6 +14,47 @@
 #include <EEPROM.h>
 #include <assert.h>
 
+/*
+ * This is for the LCD and button interface we added for local control and display.
+ */
+#include <Wire.h>
+#include <Adafruit_RGBLCDShield.h>
+#include <utility/Adafruit_MCP23017.h>
+
+/*
+ * This is for the 1307 RTC we installed on the Ocean Controls main board.
+ */
+#include <TimeLib.h>
+#include <DS1307RTC.h>
+
+/*
+ * Set this to set the time to the build time.  This is currently the only way to set time (let this be defined, compile, and
+ * run right away so that the compile-time time is pretty close to the actual time).
+ */
+// #define SETTIME
+
+/*
+ * Speed at which we run the serial connection (both via USB and RS-485)
+ */
+#define SERIAL_BAUD (38400)
+
+/* 
+ *  This controls how much output we will emit on the RS-485 line.  
+ *    0: only events are reported
+ *    1: status messages are emitted every three seconds
+ *    2: all messages are enabled
+ */
+#define VERBOSE_NONE   (0)
+#define VERBOSE_MEDIUM (1)
+#define VERBOSE_ALL    (2)
+
+int verbose = VERBOSE_MEDIUM;
+
+/*
+ * Number of milliseconds to wait after boot and build display before starting operational part.
+ */
+#define INITIAL_DELAY (2000)
+
 #define _TASK_SLEEP_ON_IDLE_RUN
 #include <TaskScheduler.h>
 #include <TimeLib.h>     // for update/display of time
@@ -80,6 +121,24 @@
 // Power supply input control
 #define REL7 8  // Relay 7 is connected to Arduino Digital 8
 
+// The shield uses the I2C SCL and SDA pins. On classic Arduinos
+// this is Analog 4 and 5 so you can't use those for analogRead() anymore
+// However, you can connect other I2C sensors to the I2C bus and share
+// the I2C bus.
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+
+// These #defines make it easy to set the backlight color
+#define RED 0x1
+#define YELLOW 0x3
+#define GREEN 0x2
+#define TEAL 0x6
+#define BLUE 0x4
+#define VIOLET 0x5
+#define WHITE 0x7
+
+/*
+ * Central (and only) task scheduler data structure.
+ */
 Scheduler ts;
 
 // The next three forward declarations are hold-overs from the example code from OC.
@@ -92,27 +151,32 @@ void setbaud(char Mybaud);
 
 #define TXEN 19 // RS-485 Transmit Enable is connected to Arduino Analog 5 which is Digital 19
 
-// When true, display extra information on the serial output.  This should be controllable by the serial input stream
-bool verbose = false;
 
+/*
+ * We allocated one more byte than the length of these compiler-defined strings, to make space for the null-terminator.
+ */
+char build_date[12] = __DATE__;
+char build_time[9] = __TIME__;
 
 /*
  * These are values that may need to be tweaked.  They should be stored in EEPROM and changable through the RS-485
  * interface and possibly by a future keypad or other direct, at the device, interface.
  */
-unsigned position_upper_limit = 350;                          // Max position value (i.e., fully tilted up)
-unsigned position_lower_limit = 200;
-unsigned long max_time_tilted_up = 10ULL * 3600ULL * 1000ULL; // Lower the panels after 10 hours, maximum.
-unsigned darkness_threshold = 50;
-
-unsigned long supply_voltage_lower_limit = 11000;             // Below 11 volts, don't try to move panels other than lowering them.
-unsigned long supply_voltage_charge_limit_low = 12240;        // Turn on charger if voltage drops below this value
-unsigned long supply_voltage_charge_limit_high = 12300;       // Turn off charge when voltage goes over this value
-unsigned long supply_voltage_bms_open_threshold = 11000;       // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
-
-unsigned long accumulated_motor_on_time_limit = 60000;        // This is on-time in milliseconds, aged at 1/20th time
-unsigned long accumulated_motor_on_time_aging_rate = 20;      // Sets ratio of maximum on time to off time (1:<this variable>)
-
+struct calvals_s {
+  unsigned position_upper_limit;                          // Max position value (i.e., fully tilted up)
+  unsigned position_lower_limit;
+  unsigned long max_time_tilted_up; // Lower the panels after 10 hours, maximum.
+  unsigned darkness_threshold;
+  
+  unsigned long supply_voltage_lower_limit;             // Below 11 volts, don't try to move panels other than lowering them.
+  unsigned long supply_voltage_charge_limit_low;        // Turn on charger if voltage drops below this value
+  unsigned long supply_voltage_charge_limit_high;       // Turn off charge when voltage goes over this value
+  unsigned long supply_voltage_bms_open_threshold;       // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
+  
+  unsigned long accumulated_motor_on_time_limit;        // This is on-time in milliseconds, aged at 1/20th time
+  unsigned long accumulated_motor_on_time_aging_rate;      // Sets ratio of maximum on time to off time (1:<this variable>)
+  unsigned backlight_on_time; // Number of seconds the LCD backlight stays on
+} calvals;
 
 /*
  * The following are global variables that are refreshed every 200 msec and availble for all tasks to 
@@ -127,14 +191,14 @@ unsigned long milliseconds;
  * ground.  We need this resistor divider network to move the 12V line to the range of the ADC, which is 0..5V.
  */
 unsigned supply_tap_voltage_raw;  // Raw ADC value: 0..1023 for 0..5V
-unsigned long supply_tap_voltage; // Raw value converted to millivolts (of the tap)
-unsigned long supply_voltage;     // Tap voltage converted to supply voltage
+unsigned supply_tap_voltage; // Raw value converted to millivolts (of the tap)
+unsigned supply_voltage;     // Tap voltage converted to supply voltage
 
 /*
  * These come from Arduino Analog input 2, which is driven by a TMP36 temperature sensor that is in the middle of the pack.
  */
 unsigned battery_temperature_volts_raw;          // raw ADC value: 0..1023 for 0..5V
-unsigned long battery_temperature_millivolts;    // raw value converted to millivolts
+unsigned battery_temperature_millivolts;    // raw value converted to millivolts
 long battery_temperature_C_x10;                  // millivolts converted to degrees Celsiuis
 unsigned long battery_temperature_F;             // Degrees C converter to Farenheight
 
@@ -143,8 +207,8 @@ unsigned long battery_temperature_F;             // Degrees C converter to Faren
  * is unused.  Its current output goes to Arduino Analog input 3.
  */
 unsigned current_sense_4V_volts_raw;         // What is read from input 3, 0..1023 for 0..5V
-unsigned long current_sense_4V_millivolts;   // Raw ADC value converted to millivolts
-unsigned long current_sense_4V_milliamps;    // Millivolts from the Attopilot device converter to milliamps it is sensing
+unsigned current_sense_4V_millivolts;   // Raw ADC value converted to millivolts
+unsigned current_sense_4V_milliamps;    // Millivolts from the Attopilot device converter to milliamps it is sensing
 
 /*
  * These two are from the sun angle sensor and are the raw values from the two tiny solar cells in that sensor
@@ -179,13 +243,6 @@ bool sun_high, sun_low, dark;
 bool at_upper_position_limit, at_lower_position_limit;
 
 /*
- * Set when we have spent more than 1% of the time with the motor and contactor on.  It is our trigger to stop moving the panels.  This
- * might happen if there is an problem where the system is trying to move the panels, but there is some failure or blockage that prevents
- * this.
- */
-bool at_time_limit;
-
-/*
  * The number of milliseconds the motor has been on in total, but aged (so it goes down with time that the motor is off).  This is used to 
  * decide how much we've been running the contactor and motor.
  */
@@ -195,6 +252,18 @@ unsigned long accumulated_motor_on_time = 0;
  * This is set when the accumulated motor on time is greater than its limit
  */
 bool motor_might_be_hot = false;
+
+
+/*
+ * When true, do the normal control of the motor relays.  When false, stay alive, but do not control anything other than
+ * the serial port and the battery charger.
+ */
+bool operational_mode = true;
+
+/*
+ * Counts down when the backlight is on.  When it is zero, we turn the backlight off.  Units are seconds.
+ */
+unsigned backlight_timer;
 
 // Forward definitions of the call-back functions that we pass to the task scheduler.
 
@@ -206,6 +275,8 @@ void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback();
 void monitor_position_limits_callback();
 void monitor_motor_on_time_callback();
 void monitor_rs485_input_callback();
+void monitor_buttons_callback();
+void monitor_lcd_backlight_callback();
 
 /* 
  * These are the tasks that are the heart of the logic that controls this system.  Some run periodically and are always enabled.  Some run only
@@ -220,12 +291,88 @@ Task monitor_upward_moving_panels_and_stop_when_sun_angle_correct(300, TASK_FORE
 Task monitor_position_limits(300, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
 Task monitor_motor_on_time(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_callback, &ts, true);
 Task monitor_rs485_input(100, TASK_FOREVER, &monitor_rs485_input_callback, &ts, true);
+Task monitor_buttons(100, TASK_FOREVER, &monitor_buttons_callback, &ts, true);
+Task monitor_lcd_backlight(TASK_SECOND, TASK_FOREVER, &monitor_lcd_backlight_callback, &ts, true);
 
 /*
  * Keep track of whether we are driving the panels up or down.  These two should never be true at the same time.
  */
 bool panels_going_up = false;
 bool panels_going_down = false;
+
+// These #defines make it easy to set the backlight color
+#define OFF 0x0
+#define RED 0x1
+#define YELLOW 0x3
+#define GREEN 0x2
+#define TEAL 0x6
+#define BLUE 0x4
+#define VIOLET 0x5
+#define WHITE 0x7 
+
+/*
+ * Set the calibration values to their "factory default".
+ */
+void set_calvals_to_defaults()
+{
+  calvals.position_upper_limit = 350;                          // Max position value (i.e., fully tilted up)
+  calvals.position_lower_limit = 200;
+  calvals.max_time_tilted_up = 10ULL * 3600ULL * 1000ULL; // Lower the panels after 10 hours, maximum.
+  calvals.darkness_threshold = 50;
+  
+  calvals.supply_voltage_lower_limit = 11000;             // Below 11 volts, don't try to move panels other than lowering them.
+  calvals.supply_voltage_charge_limit_low = 12000;        // Turn on charger if voltage drops below this value
+  calvals.supply_voltage_charge_limit_high = 12300;       // Turn off charge when voltage goes over this value
+  calvals.supply_voltage_bms_open_threshold = 11000;       // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
+  
+  calvals.accumulated_motor_on_time_limit = 60000;        // This is on-time in milliseconds, aged at 1/20th time
+  calvals.accumulated_motor_on_time_aging_rate = 20;      // Sets ratio of maximum on time to off time (1:<this variable>)
+  calvals.backlight_on_time = 60; // Number of seconds the LCD backlight stays on
+}
+/*
+ * Called every second the backlight is on and turns off the backlight, and disables itself, when the backlight timer
+ * has counted down to zero.
+ */
+void monitor_lcd_backlight_callback()
+{
+  if (backlight_timer > 0) {
+    backlight_timer--;
+    if (backlight_timer == 0) {
+      monitor_lcd_backlight.disable();
+      lcd.setBacklight(OFF);
+    }
+  }
+}
+
+/*
+ * Called every 100msec to monitor the buttons that are below the LCD.
+ */
+void monitor_buttons_callback()
+{
+  uint8_t buttons = lcd.readButtons();
+
+  if (buttons) {
+    monitor_lcd_backlight.enable();
+    backlight_timer = calvals.backlight_on_time;
+    lcd.setBacklight(YELLOW);
+    
+    if (buttons & BUTTON_UP) {
+      
+    }
+    if (buttons & BUTTON_DOWN) {
+      
+    }
+    if (buttons & BUTTON_LEFT) {
+      
+    }
+    if (buttons & BUTTON_RIGHT) {
+      
+    }
+    if (buttons & BUTTON_SELECT) {
+      
+    }
+  }
+}
 
 /*
  * Turn off both relays that drive 12VDC to the contactor inputs.  Since we aren't driving
@@ -239,6 +386,9 @@ void stop_driving_panels(void)
   panels_going_up = false;
   monitor_position_limits.disable();
   monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
+  lcd.setCursor(0,1);
+  lcd.print("Stopped ");
+  lcd.print(position_sensor_val);
 }
 
 /*
@@ -250,24 +400,37 @@ void fail(char *fail_message)
   stop_driving_panels();
   enable_rs485_output();
   Serial.println(fail_message);
+  lcd.setCursor(0,0);
+  lcd.print(fail_message);
   delay(500); // Give the serial link time to propogate the error message before execution ends
   abort();
 }
 
+bool txenabled;
+
 /*
  * Our RS-485 output is only active when we are transmitting.  Otherwise, we have this half-duplex channel
- * in a listening mode so that we can receive commands.
+ * in a listening mode so that we can receive commands.  See
  */
 void enable_rs485_output()
 {
   digitalWrite(TXEN, HIGH);   //Enable Transmit
   delay(1);                   //Let 485 chip go into Transmit Mode
+  txenabled = true;
 }
 
+/*
+ * Disable the connection from the output of our UART to the RS-485 lines.  See
+ * https://exploreembedded.com/wiki/UART_Programming_with_Atmega128
+ * For more information on the UART programming.
+ */
 void disable_rs485_output()
 {
-  while (!(UCSR0A & (1 << TXC0))); 
+  Serial.flush();
+  while (!(UCSR0A & (1 << TXC0)));      // Wait for the transmit buffer to be empty
   digitalWrite(TXEN,LOW);               //Turn off transmit enable
+  txenabled = false;
+  delay(100); // Desparate attempt
 }
 
 /*
@@ -280,6 +443,8 @@ void drive_panels_up(void)
     fail("drive_panels_up() called while panels_going_down is true");
   } else {
     digitalWrite(REL1,HIGH); // Turn on go-up relay
+    lcd.setCursor(0,1);
+    lcd.print("Going up ");
     panels_going_up = true;
     monitor_position_limits.enable();
   }
@@ -296,6 +461,8 @@ void drive_panels_down(void)
     fail("drive_panels_down() called while panels_going_up is true");
     
   } else {
+    lcd.setCursor(0,1);
+    lcd.print("Going down ");
     digitalWrite(REL2,HIGH);  // Turn on go-down relay
     panels_going_down = true;
     monitor_position_limits.enable();
@@ -342,17 +509,17 @@ void read_inputs_callback()
    * first by calculation based on the measured values of the resistors and then fine tuned with measurements
    * with 5.5 digit multimeter (Rigol DM3058).
    */
-  supply_tap_voltage = (((unsigned long)supply_tap_voltage_raw * 5036ULL) / 1023ULL) + 2;
+  supply_tap_voltage = (((unsigned long)supply_tap_voltage_raw * 5036UL) / 1023UL) + 2;
   supply_voltage = (supply_tap_voltage * 10000UL) / 3245UL;
   
   battery_temperature_volts_raw = analogRead(ANIN5);
-  battery_temperature_millivolts = ((battery_temperature_volts_raw * 5000ULL) / 1023) + 20 /* Calibration value */;
+  battery_temperature_millivolts = (((unsigned long)battery_temperature_volts_raw * 5000UL) / 1023) + 20 /* Calibration value */;
   battery_temperature_C_x10 = battery_temperature_millivolts - 500;
-  battery_temperature_F = (((battery_temperature_C_x10 * 90) / 50) + 320) / 10;
+  battery_temperature_F = ((((long)battery_temperature_C_x10 * 90L) / 50L) + 320L) / 10L;
   
   current_sense_4V_volts_raw = analogRead(ANIN6);
-  current_sense_4V_millivolts = (current_sense_4V_volts_raw * 5000ULL) / 1023;
-  current_sense_4V_milliamps = (current_sense_4V_millivolts * 1000ULL) / 36600ULL;
+  current_sense_4V_millivolts = ((unsigned long)current_sense_4V_volts_raw * 5000UL) / 1023UL;
+  current_sense_4V_milliamps = ((unsigned long)current_sense_4V_millivolts * 1000UL) / 36600UL;
 
   /* 
    *  The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
@@ -362,11 +529,18 @@ void read_inputs_callback()
   upper_solar_val = (analogRead(ANIN2) + upper_solar_val) / 2;
   position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
 
-  dark = lower_solar_val < darkness_threshold && upper_solar_val < darkness_threshold;
+  dark = (lower_solar_val + upper_solar_val) / 2 <= calvals.darkness_threshold;
   sun_high = (dark == false) && ((lower_solar_val + 10) < upper_solar_val);
   sun_low = dark || (lower_solar_val > (upper_solar_val + 10));
-  at_upper_position_limit = position_sensor_val >= position_upper_limit;
-  at_lower_position_limit = position_sensor_val < position_lower_limit;
+  at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
+  at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;
+}
+
+void print2digits(int number) {
+  if (number >= 0 && number < 10) {
+    Serial.write('0');
+  }
+  Serial.print(number);
 }
 
 /*
@@ -378,83 +552,162 @@ void read_inputs_callback()
  */
 void print_status_callback()
 {
+  static bool try_rtc = true;
+
   enable_rs485_output();
-  Serial.print("[");
-  Serial.print(seconds);
-  Serial.print(":");
-  Serial.print(milliseconds);
-  Serial.print("] ");
-  Serial.print("<");
-  if (verbose) {
-    Serial.print(supply_tap_voltage_raw);
-    Serial.print(",");
-    Serial.print(supply_tap_voltage);
-    Serial.print(",");
-  }
-  Serial.print(supply_voltage / 1000);
-  Serial.print(".");
-  Serial.print(supply_voltage % 1000);
-  Serial.print("V><");
- 
-  if (verbose) { 
-    Serial.print(battery_temperature_millivolts);
-    Serial.print("VDC,");
-  }
-  Serial.print(battery_temperature_F);
-  Serial.print("F>");
- 
-  Serial.print("<");
-  if (verbose) {
-    Serial.print(current_sense_4V_millivolts);
-    Serial.print("mV,");
-  }
-  Serial.print(current_sense_4V_milliamps);
-  Serial.print("mA><");
-  Serial.print(accumulated_motor_on_time);
-  Serial.print("msec>Position: ");
+  if (verbose > VERBOSE_NONE) {
+    if (try_rtc) {
+      tmElements_t tm;
   
+      if (RTC.read(tm)) {
+        Serial.write('[');
+        Serial.print(tm.Day);
+        Serial.write('-');
+        Serial.print(tm.Month);
+        Serial.write('-');
+        Serial.print(tmYearToCalendar(tm.Year));
+        Serial.print(' ');
+        print2digits(tm.Hour);
+        Serial.write(':');
+        print2digits(tm.Minute);
+        Serial.write(':');
+        print2digits(tm.Second);
+        Serial.print(F("] "));
+        
+       } else {
+         if (RTC.chipPresent()) {
+           Serial.println(F("The DS1307 is stopped.  Please run the SetTime"));
+           Serial.println(F("example to initialize the time and begin running."));
+           Serial.println();
+         } else {
+           Serial.println(F("DS1307 read error!  Please check the circuitry."));
+           try_rtc = false;
+           Serial.println();
+         }
+      }
+    } else {
+      // No RTC, use the counts-from-boot default time.
+      Serial.write('[');
+      Serial.print(seconds);
+      Serial.write(':');
+      Serial.print(milliseconds);
+      Serial.print(F("] "));
+      Serial.write('<');
+    }
+    Serial.write('<');
+    if (VERBOSE_MEDIUM > 1) {
+      Serial.print(supply_tap_voltage_raw);
+      Serial.write(',');
+      Serial.print(supply_tap_voltage);
+      Serial.write(',');
+    }
+    Serial.print(supply_voltage / 1000);
+    Serial.write('.');
+    Serial.print(supply_voltage % 1000);
+    Serial.print(F("V><"));
+   
+    if (verbose > VERBOSE_MEDIUM) { 
+      Serial.print(battery_temperature_millivolts);
+      Serial.print(F("VDC,"));
+    }
+    Serial.print(battery_temperature_F);
+    Serial.print(F("F>"));
+   
+    Serial.write('<');
+    if (verbose > VERBOSE_MEDIUM) {
+      Serial.print(current_sense_4V_millivolts);
+      Serial.print(F("mV,"));
+    }
+    Serial.print(current_sense_4V_milliamps);
+    Serial.print(F("mA><"));
+    Serial.print(accumulated_motor_on_time);
+    Serial.print(F("msec>Position: "));
+    
     Serial.print(position_sensor_val);
     
-    Serial.print("  Lower Solar: ");
+    Serial.print(F("  Lower Solar: "));
     Serial.print(lower_solar_val);
 
-    Serial.print("  Upper Solar: ");
+    Serial.print(F("  Upper Solar: "));
     Serial.print(upper_solar_val);
 
     if (dark) {
-      Serial.print("<Night>");
+      Serial.print(F("<Night>"));
     } else {
-      Serial.print("<Day>");
+      Serial.print(F("<Day>"));
     }
     if (sun_high) {
-      Serial.print("<Sun-high>");
+      Serial.print(F("<Sun-high>"));
     }
     if (sun_low) {
-      Serial.print("<Sun-low>");
+      Serial.print(F("<Sun-low>"));
     }
     if (at_upper_position_limit) {
-      Serial.print("<Upper-position-limit>");
+      Serial.print(F("<Upper-position-limit>"));
     }
     if (at_lower_position_limit) {
-      Serial.print("<Lower-position-limit>");
-    }
-    if (at_time_limit) {
-      Serial.print("<Time-limit>");
+      Serial.print(F("<Lower-position-limit>"));
     }
     if (panels_going_up) {
-      Serial.print("<Up>");
+      Serial.print(F("<Up>"));
     }
     if (panels_going_down) {
-      Serial.print("<Down>");
+      Serial.print(F("<Down>"));
     }
     if (power_supply_on) {
-      Serial.print("<power supply on>");
+      Serial.print(F("<power supply on>"));
     } 
     if (motor_might_be_hot) {
-      Serial.print("<motor might be hot>");
+      Serial.print(F("<motor might be hot>"));
     }
     Serial.println("");
     disable_rs485_output();
+  }
+  
+  
+  lcd.setCursor(0,0);
+  int bytes = lcd.print(position_sensor_val);
+  bytes += lcd.print(" ");
+  bytes += lcd.print(supply_voltage / 1000);
+  bytes += lcd.print(".");
+  bytes += lcd.print(supply_voltage % 1000);
+  bytes += lcd.print(" ");
+  bytes += lcd.print(battery_temperature_F);
+  while (bytes < 16) {
+    bytes += lcd.print(" ");
+  }
+  lcd.setCursor(0,1);
+  char c1 = ' ';
+  if (panels_going_up) {
+    c1 = 'U';
+  } else if (panels_going_down) {
+    c1 = 'D';
+  } else if (motor_might_be_hot) {
+    c1 = 'H';
+  }
+  bytes = lcd.print(c1);
+
+  char c2 = ' ';
+  if (at_upper_position_limit) {
+    c2 = 'u';
+  } else if (at_lower_position_limit) {
+    c2 = 'l';
+  }
+  bytes += lcd.print(c2);
+  
+  char c3 = ' ';
+  if (power_supply_on) {
+    c3 = 'P';
+  }
+  bytes += lcd.print(c3);
+
+  bytes += lcd.print(" ");
+  bytes += lcd.print(lower_solar_val);
+  bytes += lcd.print(" ");
+  bytes += lcd.print(upper_solar_val);
+  while (bytes < 16) {
+    bytes += lcd.print(" ");
+  }
 }
 
 /*
@@ -462,7 +715,7 @@ void print_status_callback()
  */
 void control_battery_charger_callback()
 {
-  if (supply_voltage < supply_voltage_charge_limit_low) {
+  if (supply_voltage < calvals.supply_voltage_charge_limit_low) {
 
     /*
      * If the power supply was already on and the voltage is really low, then
@@ -470,26 +723,28 @@ void control_battery_charger_callback()
      * In this case, we lower the the charge limit range unless the upper limit is 
      * already below 12 volts.
      */
-    if (power_supply_on && supply_voltage < supply_voltage_bms_open_threshold) {
-      if (supply_voltage_charge_limit_high > 12000) {
-        Serial.print("BMS open?  supply_voltage: ");
+    if (power_supply_on && supply_voltage < calvals.supply_voltage_bms_open_threshold) {
+      if (calvals.supply_voltage_charge_limit_high > 12000) {
+        enable_rs485_output();
+        Serial.print(F("BMS open?  supply_voltage: "));
         Serial.println(supply_voltage);
 
         /*
          * Move the charge range down 10 millivolts
          */
-        supply_voltage_charge_limit_high -= 10;
-        supply_voltage_charge_limit_low -= 10;
-        Serial.print(" reducing supply_voltage_charge_limit_high: ");
-        Serial.print(supply_voltage_charge_limit_high);
-        Serial.print(" and supply_voltage_charge_limit_low: ");
-        Serial.print(supply_voltage_charge_limit_low);
+        calvals.supply_voltage_charge_limit_high -= 10;
+        calvals.supply_voltage_charge_limit_low -= 10;
+        Serial.print(F(" reducing supply_voltage_charge_limit_high: "));
+        Serial.print(calvals.supply_voltage_charge_limit_high);
+        Serial.print(F(" and supply_voltage_charge_limit_low: "));
+        Serial.print(calvals.supply_voltage_charge_limit_low);
+        disable_rs485_output();
         turn_off_power_supply();
       }  
     } else {   // Turn on power supply to charge our batteries
      turn_on_power_supply();
     }
-  } else if (supply_voltage > supply_voltage_charge_limit_high) {
+  } else if (supply_voltage > calvals.supply_voltage_charge_limit_high) {
     turn_off_power_supply();
   }
 }
@@ -499,17 +754,11 @@ void control_battery_charger_callback()
  */
 void monitor_position_limits_callback()
 {
-  if (panels_going_up && at_upper_position_limit && position_sensor_val > (position_upper_limit + 20)) {
+  if (panels_going_up && at_upper_position_limit && position_sensor_val > (calvals.position_upper_limit + 20)) {
     stop_driving_panels();
-    enable_rs485_output();
-    Serial.print("monitor_position_limits(): at upper limit, stopping");
-    disable_rs485_output();
   }
-  if (panels_going_down && at_lower_position_limit && position_sensor_val <= (position_lower_limit - 20)) {
+  if (panels_going_down && at_lower_position_limit && position_sensor_val <= (calvals.position_lower_limit - 20)) {
     stop_driving_panels();
-    enable_rs485_output();
-    Serial.print("monitor_position_limits(): at lower limit, stopping");
-    disable_rs485_output();
   }
 }
 
@@ -531,19 +780,16 @@ void monitor_motor_on_time_callback()
     accumulated_motor_on_time += time_elapsed;
   } else {
     // For every second the motor is on, let it cool for a number of (configurable) seconds.
-    unsigned long delta = time_elapsed / accumulated_motor_on_time_aging_rate;
+    unsigned long delta = time_elapsed / calvals.accumulated_motor_on_time_aging_rate;
     if (accumulated_motor_on_time < delta) {
       accumulated_motor_on_time = 0;
     } else {
       accumulated_motor_on_time -= delta;
     }
   }
-  motor_might_be_hot = accumulated_motor_on_time > accumulated_motor_on_time_limit;
+  motor_might_be_hot = accumulated_motor_on_time > calvals.accumulated_motor_on_time_limit;
   if (motor_might_be_hot && (panels_going_up || panels_going_down)) {
     stop_driving_panels();
-    enable_rs485_output();
-    Serial.print("monitor_temperature_limit_callback(): at upper temperature limit, stopping");
-    disable_rs485_output();
   }
 }
 
@@ -554,14 +800,10 @@ void monitor_motor_on_time_callback()
 void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
 {
   if (panels_going_up == false) {
-    enable_rs485_output();
     fail("monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback(): panels_going_up == false");
   }
   if (sun_low == true) {
     stop_driving_panels();
-    enable_rs485_output();
-    Serial.print("monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback(): sun_low");
-    disable_rs485_output();
   }
 }
 
@@ -574,37 +816,182 @@ void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
  */
 void control_hydraulics_callback()
 {
-  // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
-  bool supply_voltage_ok = supply_voltage > supply_voltage_lower_limit;
-  
-  if (sun_high && at_upper_position_limit == false && 
-    panels_going_up == false && 
-    panels_going_down == false && 
-    at_time_limit == false && 
-    supply_voltage_ok && 
-    motor_might_be_hot == false) {
-    if (time_of_first_raise == 0ULL) {
-      time_of_first_raise = time_now;
-    }
-    enable_rs485_output();
-    Serial.println("  raise panels ");
-    disable_rs485_output();
-    drive_panels_up();
-    monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
-  } 
-  unsigned long time_since_first_raise = time_now - time_of_first_raise;
-  bool bedtime = (time_since_first_raise > max_time_tilted_up) || dark;
-  if (panels_going_up == false && panels_going_down == false && bedtime) {
-    if (at_lower_position_limit == false) {
-      drive_panels_down();
+  if (operational_mode) {
+    // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
+    bool supply_voltage_ok = supply_voltage > calvals.supply_voltage_lower_limit;
+    
+    if (sun_high && at_upper_position_limit == false && 
+      panels_going_up == false && 
+      panels_going_down == false && 
+      supply_voltage_ok && 
+      motor_might_be_hot == false) {
+      if (time_of_first_raise == 0ULL) {
+        time_of_first_raise = time_now;
+      }
+      drive_panels_up();
+      monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
+    } 
+    unsigned long time_since_first_raise = time_now - time_of_first_raise;
+    bool bedtime = (time_since_first_raise > calvals.max_time_tilted_up) || dark;
+    if (panels_going_up == false && panels_going_down == false && bedtime) {
+      if (at_lower_position_limit == false) {
+        drive_panels_down();
+      }
     }
   }
 }
 
 /*
- * This is the value in 0..99 of this device's RS-485 address.  It is used by the needs-work RS-485 code at the end of this file.
+ * Function copied from Arduino tutorial, modified to use arbitrary pointer, calculates the CRC 
  */
-char Unitaddress;
+unsigned long crc(unsigned char *base_p, unsigned len) 
+{
+  const unsigned long crc_table[16] = {
+    0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+    0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+    0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+    0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+  };
+
+  unsigned long crc = ~0L;
+
+  for (int index = 0 ; index < len  ; ++index) {
+    crc = crc_table[(crc ^ base_p[index]) & 0x0f] ^ (crc >> 4);
+    crc = crc_table[(crc ^ (base_p[index] >> 4)) & 0x0f] ^ (crc >> 4);
+    crc = ~crc;
+  }
+  return crc;
+}
+
+/*
+ * Write the structure 'calvals' to EEPROM starting at EEPROM location zero.  Calculate its
+ * checksum and write that after 'calvals'.  Read back 'calvals' and verify it was correct.
+ * This assumes that the RS-485 transmitter is enabled.
+ */
+void write_calvals_to_eeprom()
+{
+  unsigned eeprom_crc_value = 0;
+  unsigned calvals_crc_value = 0;
+  struct calvals_s temp_calvals;
+
+  if (txenabled == false) {
+    fail("txenabled is false in write_calvals_to_eeprom()");
+  }
+  int i;
+  for (i = 0; i < sizeof(calvals) ; i++) {
+    EEPROM.update(i, ((unsigned char *)&calvals)[i]);
+  }
+  // Now write the CRC bytes to EEPROM
+  calvals_crc_value = crc((unsigned char *)&calvals, sizeof(calvals));
+  for (int j = 0 ; j < sizeof(unsigned long) ; j++) {
+    EEPROM.update(i + j, ((unsigned char *)&calvals_crc_value)[j]);
+  }
+  // Fetch the EEPROM contents back and verify that they match what we wroge
+  EEPROM.get(0 /* EEPROM address */, temp_calvals);
+
+  for (int i = 0; i < sizeof(calvals) ; i++) {
+    if (((unsigned char *)&temp_calvals)[i] != ((unsigned char *)&calvals)[i]) {
+      
+      Serial.print(F("Error writing calvals to EEPROM starting at byte "));
+      Serial.println(i);
+      for (int i = 0; i < sizeof(calvals) ; i++) {
+        Serial.write(' ');
+        Serial.print(((unsigned char *)&temp_calvals)[i], HEX);
+      } 
+      Serial.println("");
+      
+      break;
+    }
+  }
+  EEPROM.get(sizeof(calvals), eeprom_crc_value);
+  if (eeprom_crc_value != calvals_crc_value) {
+    Serial.print(F("Error reading CRC to EEPROM"));
+  }
+}
+
+/*
+ * Print the calibration values to RS-485 output.  This assumes that the RS-485 transmitter is already enabled.
+ */
+void print_calvals()
+{
+  if (txenabled == false) {
+    fail("txenabled is false in print_calvals...");
+  }
+
+  Serial.print(F("Build date: "));
+  Serial.println(build_date);
+
+  Serial.print(F("Build time: "));
+  Serial.println(build_time);
+  
+  Serial.print(F("unsigned position_upper_limit: "));
+  Serial.println(calvals.position_upper_limit);
+  
+  Serial.print(F("position_lower_limit: "));
+  Serial.println(calvals.position_lower_limit);
+  
+  Serial.print(F("max_time_tilted_up: "));
+  Serial.println(calvals.max_time_tilted_up);
+
+  Serial.print(F("darkness_threshold: "));
+  Serial.print(calvals.darkness_threshold);
+  
+  Serial.print(F("supply_voltage_lower_limit: "));
+  Serial.println(calvals.supply_voltage_lower_limit);
+  
+  Serial.print(F("supply_voltage_charge_limit_low: "));
+  Serial.print(calvals.supply_voltage_charge_limit_low);
+  
+  Serial.print(F("supply_voltage_charge_limit_high: "));
+  Serial.println(calvals.supply_voltage_charge_limit_high);
+  
+  Serial.print(F("supply_voltage_bms_open_threshold: "));
+  Serial.println(calvals.supply_voltage_bms_open_threshold);
+ 
+  Serial.print(F("accumulated_motor_on_time_limit: "));
+  Serial.println(calvals.accumulated_motor_on_time_limit);
+  
+  Serial.print(F("accumulated_motor_on_time_aging_rate: "));
+  Serial.println(calvals.accumulated_motor_on_time_aging_rate);
+}
+
+/*
+ * Read the calibration values from the EEPROM.  If their checksum fails, then do not update the calibration values
+ * in 'calvals'.  If the passed flag is set and the checksum doesn't match, then write the existing (default)
+ * calibration values to EEPROM instead.
+ * This function assumes that the rs-485 is enabled.
+ */
+void read_calvals_from_eeprom(bool fix_if_checksum_fails)
+{
+  unsigned eeprom_crc_value = 0;
+  unsigned calvals_crc_value = 0;
+  unsigned stored_eeprom_crc_value = 0;
+  struct calvals_s temp_calvals;
+  if (txenabled == false) {
+    fail("txenabled is false in read_calvals...");
+  }
+  /*
+   * Fetch the calvals structure from EEPROM and the stored CRC that follows it.
+   */
+  EEPROM.get(0 /* EEPROM address */, temp_calvals);
+  EEPROM.get(sizeof(calvals), stored_eeprom_crc_value);
+
+  /*
+   * Calculate the CRC of what we just fetched from EEPROM
+   */
+  eeprom_crc_value = crc((unsigned char *)&temp_calvals, sizeof(temp_calvals));
+
+  if (eeprom_crc_value != stored_eeprom_crc_value) {
+    Serial.println(F("CRCs don't match"));
+
+    if (fix_if_checksum_fails) {
+      Serial.println(F("updating EERPOM with defaults"));
+      write_calvals_to_eeprom();
+    }
+  } else {
+    calvals = temp_calvals;
+  }
+}
 
 /*
  * This is the function that the Arudino run time system calls once, just after start up.  We have to set the 
@@ -621,21 +1008,38 @@ void setup()
   
   pinMode(TXEN, OUTPUT);
 
-  // Redo the use of EEPROM to use it for all the calibration values
-  //Read Address, Baud and Parity from EEPROM Here  
-  Unitaddress = EEPROM.read(0);
-  if ((Unitaddress > 99) || (Unitaddress < 0))
-  {
-    Unitaddress = 0;  
-  }
-  Serial.begin(115200);
-   
+  // Set the working calibration values to the defaults that are in this file
+  set_calvals_to_defaults();
+
+  lcd.begin(16, 2);
+  lcd.print("Solartracker 1.0");
+  lcd.setCursor(0, 1);
+  lcd.print(build_date);
+
+  Serial.begin(SERIAL_BAUD);
   UCSR0A=UCSR0A |(1 << TXC0); //Clear Transmit Complete Flag
+     
   enable_rs485_output();
-  Serial.println("Ocean Controls (Suntracker)");
-  while (!(UCSR0A & (1 << TXC0))); 
-  Serial.println("KTA-223 v3.3");
-  while (!(UCSR0A & (1 << TXC0)));    //Wait for Transmit to finish
+  Serial.print(F("Suntracker "));
+  Serial.print(build_date);
+  Serial.write(' ');
+  Serial.println(build_time);
+
+#ifdef SETTIME
+  void setup_rtc();
+  setup_rtc();
+#endif
+
+  // Try reading calibration values from EEPROM.  If that fails, write our default calibration values to EERPOM
+  read_calvals_from_eeprom(true);
+  backlight_timer = calvals.backlight_on_time;
+
+  // Drop junk in receive buffer
+  while (Serial.available() > 0) 
+  {   
+    (void)Serial.read();  
+  }
+  delay(INITIAL_DELAY);
   disable_rs485_output();         //Turn off transmit enable
 }
 
@@ -648,489 +1052,180 @@ void loop()
   ts.execute();
 }
 
-// The next block of variables are hold overs. Ugly code with globals that don't need to be global.
-char  Rxchar, Rxenable, Rxptr, Cmdcomplete, R;
-char Rxbuf[15];
-char adrbuf[3], cmdbuf[3], valbuf[12];
-char rxaddress, Unitbaud;
-char Dip[5], Dop[9];
-char Hold, Mask, Analog =1, Imax;     
-int anreadings[3];
-unsigned long RelayStartTime[8], WatchdogStartTime;
-unsigned char RelayOnTime[8], WatchdogOnTime;
-
 /*
- * The code from here to the end of the file is not working yet, needs major rework.  It is derived
- * from the original Ocean Controls example code (which probably worked fine).
+ * This serial code _was_ working, then it seemed to throw away most of the input characters and 
+ * when it did receive some, they were often values like 0xff or other bytes with
+ * most bits set.  Converting to using serialEvent() does not seem to have changed that.  
  */
-void monitor_rs485_input_callback()
+void monitor_rs485_input_callback() 
 {   
-  if (Serial.available() > 0)    // Is a character waiting in the buffer?
-  {
-    Serial.println("Serial avaiable");
-    Rxchar = Serial.read();      // Get the waiting character
-    Serial.println(Rxchar);
-    if (Rxchar == '@')      // Can start recording after @ symbol
-    {
-      if (Cmdcomplete != 1)
-      {
-        Rxenable = 1;
-        Rxptr = 1;
-      }//end cmdcomplete
-    }//end rxchar
-    if (Rxenable == 1)           // its enabled so record the characters
-    {
-      if ((Rxchar != 32) && (Rxchar != '@')) //dont save the spaces or @ symbol
-      {
-        Rxbuf[Rxptr] = Rxchar;
-        
-        Rxptr++;
-        if (Rxptr > 13) 
-        {
-          Rxenable = 0;
-        }//end rxptr
-      }//end rxchar
-      if (Rxchar == 13) 
-      {
-        Rxenable = 0;
-        Cmdcomplete = 1;
-      }//end rxchar
-    }//end rxenable
+  if (txenabled == true) {
+    fail("txenabled in monitor_rs485...");
+  }
+}
 
-  }// end serial available
+void serialEvent() 
+{
+  if (Serial.available() == 0) {
+    fail("serialEvent()");
+  }
 
+  // This may fail, but I haven't see it fail yet.  I think it is just a matter of time, but in the meantime, I want
+  // to ensure that the issues I am seeing are not due to entering this function with txenabled.
+  if (txenabled == true) {
+    fail("txenabled in serialEvent()");
+  }
+    char c = Serial.read();      // Get the waiting character
+    
+    switch (c) {
+      case 'v':
+        enable_rs485_output();
+        verbose = (verbose + 1) % (VERBOSE_ALL + 1); // Cycle between 0, 1, 2
+        Serial.print(F("Verbosity level now: "));
+        Serial.println(verbose);
+        break;
 
-   //we should now have AACCXXXX in the rxbuf array, with a cr at rxptr
-   //we should take rxbuf(1) and rxbuf(2) and turn them into a number
-
-  if (Cmdcomplete == 1)
-  {
-     adrbuf[0] = Rxbuf[1];
-     adrbuf[1] = Rxbuf[2];
-     adrbuf[2] = 0; //null terminate Mystr = Chr(rxbuf(1)) + Chr(rxbuf(2))
-     rxaddress = atoi(adrbuf);//    Address = Val(mystr)
-  //Serial.println(adrbuf);
-     cmdbuf[0] = toupper(Rxbuf[3]); //copy and convert to upper case
-     cmdbuf[1] = toupper(Rxbuf[4]); //copy and convert to upper case
-     cmdbuf[2] = 0; //null terminate        Command = Chr(rxbuf(3)) + Chr(rxbuf(4))
-     //   Command = Ucase(command)
-  //Serial.println(cmdbuf);
-     valbuf[0] = Rxbuf[5]; //        Mystr = Chr(rxbuf(5))
-        R = Rxptr - 1;
-            for (int i = 6 ; i <= R ; i++)//For I = 6 To R
-            {
-                valbuf[i-5] = Rxbuf[i]; //Mystr = Mystr + Chr(rxbuf(i))
-            }
-     valbuf[R+1] = 0; //null terminate
-     int Param = atoi(valbuf);//   Param = Val(mystr)
-
-     //Serial.println(Param); //   'Print "Parameter: " ; Param
-
-       if ((rxaddress == Unitaddress) || (rxaddress == 0)) //0 is wildcard address, all units respond
-       {
-
-         //switch (cmdbuf) //Select Case Command
-         //{
-              if (strcmp(cmdbuf,"ON")==0)                                   //'turn relay x ON
-              {
-                   //'Print "command was ON"
-                   if ((Param <= 8) && (Param >= 0)) 
-                   {
-                     if (Param == 0)
-                     { 
-                        for (int i = 1 ; i<=8 ; i++)
-                        {
-                          Dop[i-1] = 1;
-                          RelayOnTime[i-1]= 0;//override the timing
-                        }
-                     }
-                     else
-                     {
-                        Dop[Param-1] = 1;
-                        RelayOnTime[Param-1]= 0;//override the timing
-                     }
-                     writedops();
-                     printaddr(1);                     
-                   }
-                   else
-                   {
-                        //'Print "out of range"
-                   }
-              }
-              if (strcmp(cmdbuf,"OF")==0)                                   //'turn relay x OFF
-              {
-                   //'Print "command was OFF"
-                   if ((Param <= 8) && (Param >= 0)) 
-                   {
-                     if (Param == 0)
-                     {
-                        for (int i = 1 ; i<=8 ; i++)
-                        {
-                          Dop[i-1] = 0;
-                        }
-                     }
-                     else
-                     {
-                        Dop[Param-1] = 0;
-                     }
-                     writedops();
-                     printaddr(1);
-                   }
-                   else
-                   {
-                        //'Print "out of range"
-                   }
-              }    
-              /*
-              if (strcmp(cmdbuf,"PW")==0)        // PWM out on Relays 2, 4, 5 or 8 only
-              {                                  // Value of parameter is Relay number and 0-255 value ie 2127 will make channel 2 output 127 (50%)
-                   for ( i=0 ; i<=3 ; i++)       //
-                   {
-                     x = Param / 1000;
-                     if ( x==PWMAble[i]) //Is is on the list?
-                     {
-                       
-                       outval = Param % 1000; //Get the 0-255 value
-                       if (outval>=0 && outval <=255) //within range?
-                       {
-                         analogWrite( Relays[x-1] , outval);
-                         if (outval == 0)
-                         {
-                           Dop[x-1]=0;     //If it is 0 then we will say the Relay is OFF
-                         }
-                         else
-                         {
-                           Dop[x-1]=1;     //If it is not 0 then we will say the Relay is ON
-                         }
-                         printaddr(1);
-                       }
-                     }
-                   }
-              }
-              */
-              if (strcmp(cmdbuf,"TR")==0)        // Timed Relay
-              {                                  // Value of parameter is Relay number and 1-255 time in 0.1s increments 2127 is relay 2 for 12.7 sec
-                 int x = Param / 1000; //Get the relay number
-                 int outval = Param % 1000; //Get the 0-255 value
-                 if (outval>=1 && outval <=255) //within range?
-                 {
-                     RelayStartTime[x-1] = millis(); //save the current time
-                     RelayOnTime[x-1] = outval;
-                     Dop[x-1]=1;     //Relay on 
-                     writedops();    //Write outputs
-                     printaddr(1);
-                 }
-              }
-              
-              if (strcmp(cmdbuf,"KA")==0)        // Keep Alive
-              {                                  // Value of parameter is seconds to stay alive for
-                 
-                 if (Param>=0 && Param <=255) //within range?
-                 {
-                     WatchdogStartTime = millis(); //save the current time
-                     WatchdogOnTime = Param;
-                     printaddr(1);
-                 }
-              }
-              
-              if (strcmp(cmdbuf,"WR")==0)                                    //'turn relay on/off according to binary value of x
-              {
-                    //'Print "command was WRITE"
-                   if ((Param <= 255) && (Param >= 0)) 
-                   {
-                    for (int i=0 ; i<8 ; i++)
-                    {
-                       Mask = 1<<i;//Shift Mask , Left , I
-                       Hold = Param & Mask;
-                       /*'Print "mask=" ; Mask
-'                                Print " I= " ; I
-'                                Print "param=" ; Param
-'                                print "hold=" ; Hold
-*/
-                       if (Hold == Mask)
-                       {
-                          Dop[i] = 1;
-                          RelayOnTime[i]= 0; //override timing
-                       }
-                       else
-                       {
-                          Dop[i] = 0;
-                       }
-                    }
-                   }
-                   else
-                   {
-                   }
-                   writedops();
-                   printaddr(1);
-                   
-              }
-              
-              if (strcmp(cmdbuf,"RS")==0)                                   // 'relay status
-              {
-                    //'Print "command was RELAY STATUS"
-                    if ((Param > 0) && (Param <= 8))
-                   {
-                         printaddr(2);
-                         Serial.println(Dop[Param-1], DEC);
-                   }
-                   else if (Param == 0) 
-                   {
-                         int N = 0;
-                         for (int i=0 ; i<8 ; i++)
-                         {
-                            if(Dop[i] == 1)
-                            {
-                               N = N|(1<<i);
-                            }
-                         }
-                         printaddr(2);
-                         Serial.println(N, DEC);
-                   }
-                   else
-                   {
-                     //'Print "out of range"
-                   }
-              }   
-
-              if (strcmp(cmdbuf,"IS")==0)                                   // 'input status
-              {
-               // readdips();                 
-                     if ((Param > 0) && (Param <= 4)) 
-                     {
-                       printaddr(2);
-                       Serial.println(Dip[Param-1], DEC);
-                       
-                     }
-                     else if (Param == 0)
-                     {
-                        int N = 0;
-                        if (Analog == 1)
-                        {
-                          Imax = 3;
-                        }
-                        else 
-                        {
-                          Imax = 8;
-                        }
-
-                        for (int i=0 ; i<=Imax ; i++)
-                        {
-                          if (Dip[i] == 1)
-                          {
-                           N = N|(1<<i);
-                          }
-                        }
-                        printaddr(2);
-                        Serial.println(N,DEC);
+      case '*':
+        while (Serial.available() == 0);
+        c = Serial.read();
+        enable_rs485_output();
+        Serial.println("");
+        switch (c) {
+          case 'f':
+            set_calvals_to_defaults();
+            Serial.println(F("restored factory defaults to working calibration values"));
+            Serial.println(F("use the s command to save them to EEPROM"));
+            break;
           
-                     }
-                     else
-                     {
-                      //        'Print "out of range"
-                     }
-              }
+          case 'u':  // Set upper position limit to current position
+            calvals.position_upper_limit = position_sensor_val;
+            Serial.print(F("Setting upper position limit to "));
+            Serial.println(calvals.position_upper_limit);      
+            break;
 
-              if (strcmp(cmdbuf,"AI")==0)                                   // 'return analog input
-              {                                   
-                    if (Analog == 1)
-                    {
-                       if ((Param >= 0) && (Param <= 3))
-                       {
-                         for (int i=0 ; i<3 ; i++)
-                         {
-                          // anreadings[i] = analogRead(Analogs[i]);
-                         }
-                         printaddr(2);
-                         if (Param == 0)
-                         {
-                             Serial.print(anreadings[0], DEC);
-                             Serial.print(" ");
-                             Serial.print(anreadings[1], DEC);
-                             Serial.print(" ");
-                             Serial.println(anreadings[2], DEC);
-                             
-                         }
-                         else
-                         {
-                             Serial.println(anreadings[Param-1], DEC);
-                         }
-                       }
-                    }
-                    else
-                    {
-                    }
-              }
-              if (strcmp(cmdbuf,"SS")==0)                                   // System Status
-              {
-                    
-                   if (Param == 0)
-                   {
-                         int N = 0;
-                         for (int i=0 ; i<8 ; i++) //Read Relays
-                         {
-                            if(Dop[i] == 1)
-                            {
-                               N = N|(1<<i);
-                            }
-                         }
-                         printaddr(2);
-                         Serial.print(N, DEC); //Print Relays
-                         Serial.print(" ");
-                         
-                         // readdips(); //Read Inputs
-                          N = 0;
-                          if (Analog == 1)
-                          {
-                            Imax = 3;
-                          }
-                          else 
-                          {
-                            Imax = 8;
-                          }
-  
-                          for (int i=0 ; i<=Imax ; i++)
-                          {
-                            if (Dip[i] == 1)
-                            {
-                             N = N|(1<<i);
-                            }
-                          }
-                         
-                          Serial.print(N,DEC); //Print Inputs
-                          Serial.print(" ");
-                          
-                          if (Analog == 1)
-                          {
-                             for (int i=0 ; i<3 ; i++)
-                             {
-                               //anreadings[i] = analogRead(Analogs[i]); // Read Analogs
-                             }
-                             
-                             
-                                 Serial.print(anreadings[0], DEC); //Print Analogs
-                                 Serial.print(" ");
-                                 Serial.print(anreadings[1], DEC);
-                                 Serial.print(" ");
-                                 Serial.println(anreadings[2], DEC);
-                                 
-                          }
-                   }
-                   else
-                   {
-                     //'Print "out of range"
-                   }
-              }   
-              if (strcmp(cmdbuf,"SA")==0)                                   // Set Address and save to EEP
-              {
-                    //'Print "command was Set Address"
-                   if ((Param >= 0) && (Param <= 99))
-                   {
-                     Unitaddress = Param;   //make it the address
-                     EEPROM.write(0, Unitaddress);//save to eep                       
-                     printaddr(1);                         
-                   }
-                   else
-                   {
-                     //'Print "out of range"
-                   }
-              } 
-              if (strcmp(cmdbuf,"SB")==0)                                   // Set Baud and save to EEP
-              {
-                    //'Print "command was Set Baud"
-                   if ((Param > 0) && (Param <= 10))
-                   {
-                     Unitbaud = Param;   
-                     EEPROM.write(1, Unitbaud);//save to eep          
+          case 'l':  // Set lower position limit to current position
+            calvals.position_lower_limit = position_sensor_val;
+            Serial.print(F("Setting lower position limit to "));
+            Serial.println(calvals.position_lower_limit);
+            break;
 
-                     setbaud(Unitbaud);// start serial port             
-                     printaddr(1);                         
-                   }
-                   else
-                   {
-                     //'Print "out of range"
-                   }
-              } 
+          case 'd':   // Set darkness threshold.  Should be done at twighlight
+            calvals.darkness_threshold = (lower_solar_val + upper_solar_val) / 2;
+            Serial.print(F("Setting darkness threshold to: "));
+            Serial.println(calvals.darkness_threshold);
+            break;
 
-         //}//end switch cmdbuf
-       }//end address
+          case 'h':
+            Serial.println(F("*f - set factory defaults"));
+            Serial.println(F("*u - set upper position limit to current position"));
+            Serial.println(F("*l - set lower position limit to current position"));
+            Serial.println(F("*d - set darkness threshold to current light level"));
+            Serial.println(F("*h - print this help message"));
+            Serial.println(F("*p - display the values of the calibration values"));
+            Serial.println(F("*r - restore the calibration values from the EEPROM"));
+            Serial.println(F("*s - save calibration values to EEPROM"));
+            Serial.println(F("*t - toggle operational mode"));
+            break;
 
+          case 'p': // Print the calvals
+            print_calvals();
+            break;
 
-      Cmdcomplete = 0;
-  }//end cmdcomplete 
-    while (!(UCSR0A & (1 << TXC0)));    //Wait for Transmit to finish
-    digitalWrite(TXEN,LOW);               //Turn off transmit enable
-}//end check_rs485()
+          case 'r': // Restore calibration values from EEPROM
+            read_calvals_from_eeprom(false);
+            break;
+        
+          case 's': // Save calibration values to EEPROM
+            Serial.println(F("Saving calibration values to EEPROM"));
+            write_calvals_to_eeprom();
+            break;
 
-
-void writedops(void)
-{
-  for (int i=0 ; i<8 ; i++)
-  {
-    if (Dop[i]==1)
-    {
-      // digitalWrite(Relays[i],HIGH);
+          case 't': // Toggle operational mode on and off
+            operational_mode = !operational_mode;
+            Serial.print(F("Operational mode "));
+            if (operational_mode) {
+              Serial.println(F("on"));
+            } else {
+              Serial.println(F("off"));
+              stop_driving_panels();
+            }
+            break;
+          
+          default:
+            Serial.println(F("Unrecognized command character (expected 'u', 'l', 'd', or 'h'): "));
+            break;
+        }
+        break;
+        
+      default:
+        Serial.println(F("Unrecog: "));
+        Serial.println(c & 0xff, HEX);
+        break;
     }
-    else
-    {
-      //digitalWrite(Relays[i],LOW);
+    disable_rs485_output();         //Turn off transmit enable
+}
+
+
+
+#ifdef SETTIME
+
+
+tmElements_t tm;
+
+void setup_rtc() 
+{
+  bool parse=false;
+  bool config=false;
+
+  // get the date and time the compiler was run
+  if (getDate(build_date) && getTime(build_time)) {
+    parse = true;
+    // and configure the RTC with this info
+    if (RTC.write(tm)) {
+      config = true;
     }
   }
-}
 
-void printaddr(char x) //if x=1 then it prints an enter, if x=2 then it prints a space after the address
-{
-  UCSR0A=UCSR0A |(1 << TXC0); //Clear Transmit Complete Flag
-  digitalWrite(TXEN, HIGH);   //Enable Transmit
-  delay(1);                   //Let 485 chip go into Transmit Mode
-  
-  if (Unitaddress < 10)
-  {
-    Serial.print("#0");
-    Serial.print(Unitaddress, DEC);
-  }
-  else
-  {
-    Serial.print("#"); 
-    Serial.print(Unitaddress, DEC);
-  }
-  switch(x)
-  {
-    case 1:
-        Serial.println(); //print enter
-      break;
-    case 2:
-        Serial.print(" "); //print space
-      break;
-  
+  if (parse && config) {
+    Serial.print(F("DS1307 configured Time"));
+  } else if (parse) {
+    fail("DS1307");
+    
+  } else {
+    fail("Could not parse time string");
   }
 }
 
-void setbaud(char Mybaud)
+
+bool getTime(const char *str)
 {
-   switch (Mybaud)
-   {
-    case 1 : Serial.begin(1200);
-      break;
-    case 2 : Serial.begin(2400);
-      break;     
-    case 3 : Serial.begin(4800);
-      break;
-    case 4 : Serial.begin(9600);
-      break;
-    case 5 : Serial.begin(14400);
-      break;
-    case 6 : Serial.begin(19200);
-      break;
-    case 7 : Serial.begin(28800);
-      break;
-    case 8 : Serial.begin(38400);
-      break;
-    case 9 : Serial.begin(57600);
-      break;
-    case 10 : Serial.begin(115200);
-      break;
-    default:  Serial.begin(9600);
-      break;
-   }
+  int Hour, Min, Sec;
+
+  if (sscanf(str, "%d:%d:%d", &Hour, &Min, &Sec) != 3) return false;
+  tm.Hour = Hour;
+  tm.Minute = Min;
+  tm.Second = Sec;
+  return true;
 }
+
+bool getDate(const char *str)
+{
+  char Month[12];
+  int Day, Year;
+  uint8_t monthIndex;
+  const char *monthName[12] = {
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+  if (sscanf(str, "%s %d %d", Month, &Day, &Year) != 3) return false;
+  for (monthIndex = 0; monthIndex < 12; monthIndex++) {
+    if (strcmp(Month, monthName[monthIndex]) == 0) break;
+  }
+  if (monthIndex >= 12) return false;
+  tm.Day = Day;
+  tm.Month = monthIndex + 1;
+  tm.Year = CalendarYrToTm(Year);
+  return true;
+}
+#endif
