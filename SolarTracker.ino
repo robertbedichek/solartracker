@@ -1,56 +1,70 @@
 
 /*
- * This controls three relays that control a hydraulic motor, a hydraulic valve, and a power supply.  The goal is
- * to get more power out of four LG Neon-2 420 Watt panels than if they were fixed-mounted.  A secondary goal is to
- * have them better looking.  If they were fixed-mounted, they'd need to be reversed-racked, which is not a great look.
- * 
- *  The core of the controls system is an Arduino:
- * KTA-223v3 by Ocean Controls www.oceancontrols.com.au
- * 
- * Creative Commons Licence
- * Robert Bedichek
- */
+   This controls three relays that control a hydraulic motor, a hydraulic valve, and a power supply.  The goal is
+   to get more power out of four LG Neon-2 420 Watt panels than if they were fixed-mounted.  A secondary goal is to
+   have them better looking.  If they were fixed-mounted, they'd need to be reversed-racked, which is not a great look.
+
+    The core of the controls system is an Arduino:
+   KTA-223v3 by Ocean Controls www.oceancontrols.com.au
+
+   Creative Commons Licence
+   Robert Bedichek
+*/
 
 #include <string.h> //Use the string Library
 #include <ctype.h>
 #include <EEPROM.h>
 #include <assert.h>
 
+#ifndef RS485
+#define enable_rs485_output()
+#define disable_rs485_output()
+#define txenabled (0)
+#endif
+
 #define _TASK_SLEEP_ON_IDLE_RUN
 #include <TaskScheduler.h>
 #include <TimeLib.h>     // for update/display of time
 
 /*
- *  This is for the LCD and button interface we added for local control and display.
- */
+    This is for the LCD and button interface we added for local control and display.
+*/
 #include <Wire.h>
 #include <Adafruit_RGBLCDShield.h>
 #include <utility/Adafruit_MCP23017.h>
 
 /*
- * We needed more analog inputs than the KTA-223v3 had, so we added an ADS1015, a 4-input, 12bit
- * A/D
- */
+   This is for the Sparkfun 4-relay board
+*/
+#include "SparkFun_Qwiic_Relay.h"
+#define RELAY_ADDR (0x6D)
+
+Qwiic_Relay quad_relay(RELAY_ADDR);
+
+/*
+   We needed more analog inputs than the KTA-223v3 had, so we added an ADS1015, a 4-input, 12bit
+   A/D
+*/
 #include <Adafruit_ADS1X15.h>
 //Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
 Adafruit_ADS1015 ads;     /* Use this for the 12-bit version */
 
 
 /*
- *  This is for the 1307 RTC we installed on the Ocean Controls main board.
- */
+    This is for the 1307 RTC we installed on the Ocean Controls main board.
+*/
 #include <DS1307RTC.h>
 
 
 /*
- * All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
- */
+   All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
+*/
 time_t arduino_time;
 
 /*
- * If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on 
- * the time of day being valid.
- */
+   If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on
+   the time of day being valid.
+*/
 bool time_of_day_valid = false;
 
 
@@ -72,11 +86,11 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 /*
    Speed at which we run the serial connection (both via USB and RS-485)
 */
-#define SERIAL_BAUD (230400)
+#define SERIAL_BAUD (9600)
 
 /*
- * Default number of seconds the backlight will stay on.
- */
+   Default number of seconds the backlight will stay on.
+*/
 #define DEFAULT_BACKLIGHT_ON_TIME (60 * 10)
 
 /*
@@ -120,63 +134,63 @@ enum mode_e { no_panel_movement_mode, time_mode, sensor_mode, last_mode};
 
 
 /*
- * Allocation of ATMEGA328P Analog lines -- all on "Port C"
- *  PC0 (KTA-223v3 Analog 3)      - Draw-string (position) sensor
- *  PC1 (KTA-223v3 opto-input A1) - Supply voltage (removed R16 pull-up resistor, wired directly to main board K2.2)
- *  PC2 (KTA-223v3 opto-input A2) - Battery temperature (removed R17 pull-up resistor, wired TMP36 output directly to main board K2.3)
- *  PC3 (KTA-223v3 opto-input A3) - Battery current (removed R18 pull resistor, wired Atopilot I output directly to main board K2.4)
- *  PC4 (KTA-223v3 opto-input A4) - I2C SDA (data) line 
- *  PC5 (KTA-TXEN)                - I2C SCL (clock) line (required removing D7 to disconnect this from driving RS-485 transmit-enable)
- *  PC6 (KTA-223v3 Analog 1)      - Sun sensor lower cell
- *  PC7 (KTA-223v3 Analog 2)      - Sun sensor upper cell
- */
+   Allocation of ATMEGA328P Analog lines -- all on "Port C"
+    PC0 (KTA-223v3 Analog 3)      - Draw-string (position) sensor
+    PC1 (KTA-223v3 opto-input A1) - Supply voltage (removed R16 pull-up resistor, wired directly to main board K2.2)
+    PC2 (KTA-223v3 opto-input A2) - Battery temperature (removed R17 pull-up resistor, wired TMP36 output directly to main board K2.3)
+    PC3 (KTA-223v3 opto-input A3) - Battery current (removed R18 pull resistor, wired Atopilot I output directly to main board K2.4)
+    PC4 (KTA-223v3 opto-input A4) - I2C SDA (data) line
+    PC5 (KTA-TXEN)                - I2C SCL (clock) line (required removing D7 to disconnect this from driving RS-485 transmit-enable)
+    PC6 (KTA-223v3 Analog 1)      - Sun sensor lower cell
+    PC7 (KTA-223v3 Analog 2)      - Sun sensor upper cell
+*/
 /*
- *  The inputs and outputs are thus:
- *  KTA Analog 1, which is Arduino Analog In 6, measures the voltage on the lower cell in the sun angle senseor
- *  KTA Analog 2, which is Arudino Analog In 7, measures the voltage on the upper cell in the sun angle sensor
- *  KTA Analog 3, which is Arudino Analog In 0, measures the voltage from the draw-string position sensor
- */
+    The inputs and outputs are thus:
+    KTA Analog 1, which is Arduino Analog In 6, measures the voltage on the lower cell in the sun angle senseor
+    KTA Analog 2, which is Arudino Analog In 7, measures the voltage on the upper cell in the sun angle sensor
+    KTA Analog 3, which is Arudino Analog In 0, measures the voltage from the draw-string position sensor
+*/
 
 #define ANIN1 6   // Analog 1 is connected to Arduino Analog In 6
 #define ANIN2 7   // Analog 2 is connected to Arduino Analog In 7
 #define ANIN3 0   // Analog 3 is connected to Arduino Analog In 0
 
 /*
- *   These are the only analog inputs that the KTA-223 has on the outside of its shell.  However, I needed more,
- *  so I have repurposed the opto-isolator inputs by removing the pull-up resistors that connect the outputs
- *  of the KTA-223 opto-isolators to the Arudino inputs.  I have wired directly to the Arudino board thusly:
- *  
- */
+     These are the only analog inputs that the KTA-223 has on the outside of its shell.  However, I needed more,
+    so I have repurposed the opto-isolator inputs by removing the pull-up resistors that connect the outputs
+    of the KTA-223 opto-isolators to the Arudino inputs.  I have wired directly to the Arudino board thusly:
 
-/* 
- *  To monitor the supply voltage I used Arduino Analog 1. We have a resistor divider with a 68.284k Ohm resistor
- *  in series with a 32.823k Ohm resistor. The the center tap is connected to A1 (analog input 1), the other
- * leads are connected to the supply voltage and the ground.  This input had been driven by an opto isolator with a
- * 4.7 k Ohm pull up.  We removed the pull up.
- */
+*/
+
+/*
+    To monitor the supply voltage I used Arduino Analog 1. We have a resistor divider with a 68.284k Ohm resistor
+    in series with a 32.823k Ohm resistor. The the center tap is connected to A1 (analog input 1), the other
+   leads are connected to the supply voltage and the ground.  This input had been driven by an opto isolator with a
+   4.7 k Ohm pull up.  We removed the pull up.
+*/
 #define ANIN4 1
 
 /*
- *   We needed another analog input to monitor battery temperature, so we used Arduino Analog 2.
- * It is connected to a TMP36 temperature sensor (https://learn.adafruit.com/tmp36-temperature-sensor)
- */
+     We needed another analog input to monitor battery temperature, so we used Arduino Analog 2.
+   It is connected to a TMP36 temperature sensor (https://learn.adafruit.com/tmp36-temperature-sensor)
+*/
 #define ANIN5 2
 
 // And for the output of a current sensor on the 4V line we use Arduino analog 3
 #define ANIN6 3
 
 /*
- *  We use three relay outputs.  The first passes 12VDC when active to the go-up input of the contactor
- * that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
- * input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
- * hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
- * the panels to retain their position.  Before we had this check valve, they would gradually drift back to
- *  the down position.  When we want the panels to lower, at the end of the day, we have to both release the
- * check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
- * by driving 12VDC to the "go-down" input of the contactor. The third relay we use is relay 8, which enables
- * 120VAC or 220VAC to pass to a "wall-wart" style power supply that generates 12.3VDC @ 2A.  When our battery
- * voltage falls below 12.1VDC, we turn it on.  When it rises above 12.2VDC, we turn it off.
- */
+    We use three relay outputs.  The first passes 12VDC when active to the go-up input of the contactor
+   that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
+   input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
+   hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
+   the panels to retain their position.  Before we had this check valve, they would gradually drift back to
+    the down position.  When we want the panels to lower, at the end of the day, we have to both release the
+   check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
+   by driving 12VDC to the "go-down" input of the contactor. The third relay we use is relay 8, which enables
+   120VAC or 220VAC to pass to a "wall-wart" style power supply that generates 12.3VDC @ 2A.  When our battery
+   voltage falls below 12.1VDC, we turn it on.  When it rises above 12.2VDC, we turn it off.
+*/
 
 // REL1 drives the go-up side of the contactor
 #define REL1 2  // Relay 1 is connected to Arduino Digital 2
@@ -195,12 +209,13 @@ enum mode_e { no_panel_movement_mode, time_mode, sensor_mode, last_mode};
 #define REL7 8  // Relay 7 is connected to Arduino Digital 8
 
 
+void setup_time(void);
 
-const char *operation_modestring();
+const char *operation_modestring(void);
 
 /*
- *  Central (and only) task scheduler data structure.
- */
+    Central (and only) task scheduler data structure.
+*/
 Scheduler ts;
 
 
@@ -208,12 +223,12 @@ Scheduler ts;
 #define REL8 9  // Relay 8 is connected to Arduino Digital 9 PWM
 
 
-/* 
- * We moved the transmit-enable to PB5/SCK as we are not using the SD interface, but we are using the built-in I2C interface.
- * We did this by removing D7 and replacing it with a new diode whose anode is on the SCK through-hole and who's cathode
- * is on the pad for D7's cathode.  The SPI interface must be off, (SPCR is 0), or else the SPI clock will be driven on this pin.
- */
-#define TXEN 13 
+/*
+   We moved the transmit-enable to PB5/SCK as we are not using the SD interface, but we are using the built-in I2C interface.
+   We did this by removing D7 and replacing it with a new diode whose anode is on the SCK through-hole and who's cathode
+   is on the pad for D7's cathode.  The SPI interface must be off, (SPCR is 0), or else the SPI clock will be driven on this pin.
+*/
+#define TXEN 13
 
 // #define TXEN 19 // RS-485 Transmit Enable is connected to Arduino Analog 5 which is Digital 19
 
@@ -258,21 +273,21 @@ unsigned long seconds;
 unsigned long milliseconds;
 
 /*
- * Currently this is just used by the status tracing function.  It is true when we are calling for charging power, false when we are not.
- */
+   Currently this is just used by the status tracing function.  It is true when we are calling for charging power, false when we are not.
+*/
 bool power_supply_on = false;
 
 /*
- * These come from Arudino Analog input 1, which is driven by the center tap of two resistors that connect to the 12V line and
- * ground.  We need this resistor divider network to move the 12V line to the range of the ADC, which is 0..5V.
- */
+   These come from Arudino Analog input 1, which is driven by the center tap of two resistors that connect to the 12V line and
+   ground.  We need this resistor divider network to move the 12V line to the range of the ADC, which is 0..5V.
+*/
 unsigned supply_tap_voltage_raw;  // Raw ADC value: 0..1023 for 0..5V
 unsigned supply_tap_voltage;      // Raw value converted to millivolts (of the tap)
 unsigned supply_voltage;          // Tap voltage converted to supply voltage
 
 /*
- * These come from Arduino Analog input 2, which is driven by a TMP36 temperature sensor that is in the middle of the pack.
- */
+   These come from Arduino Analog input 2, which is driven by a TMP36 temperature sensor that is in the middle of the pack.
+*/
 unsigned battery_temperature_volts_raw;     // raw ADC value: 0..1023 for 0..5V
 unsigned battery_temperature_millivolts;    // raw value converted to millivolts
 int battery_temperature_C_x10;         // millivolts converted to degrees Celsiuis
@@ -339,22 +354,22 @@ bool motor_overcurrent = false;
 unsigned backlight_timer;
 
 /*
- * Wind speed variables
- */
+   Wind speed variables
+*/
 int16_t wind_speed_raw;        // Value read from ADC
 float wind_speed_volts;        // Wind_spee_raw converted to volts
 unsigned wind_speed_knots;      // In knots
 unsigned max_wind_speed_knots = 0;  // Maximum recorded value since we started
 
 // Forward definitions of the call-back functions that we pass to the task scheduler.
-  
+
 void read_time_and_sensor_inputs_callback();
 void print_status_to_rs485_callback();
 
 
-/* 
- *  The next five callbacks and tasks interact with I2C devices.
- */
+/*
+    The next five callbacks and tasks interact with I2C devices.
+*/
 void display_status_on_lcd_callback();
 void monitor_buttons_callback();
 void monitor_lcd_backlight_callback();
@@ -403,23 +418,23 @@ bool panels_going_down = false;
 */
 void set_calvals_to_defaults()
 {
-  calvals.position_upper_limit = 430;                          // Max position value (i.e., fully tilted up)
+  calvals.position_upper_limit = 400;                          // Max position value (i.e., fully tilted up)
   calvals.position_lower_limit = 112;
   calvals.time_tilted_up_limit_in_minutes = 10 * 60; // Lower the panels after 10 hours, maximum.
   calvals.darkness_threshold = 50;
 
-  calvals.battery_charging_temperature_limit = 85;        // Do not start charging when battery temperature above 85F
+  calvals.battery_charging_temperature_limit = 90;        // Do not start charging when battery temperature above 85F
   calvals.supply_voltage_lower_limit = 11000;             // Below 11 volts, don't try to move panels other than lowering them.
-  calvals.supply_voltage_charge_limit_low = 12000;        // Turn on charger if voltage drops below this value
+  calvals.supply_voltage_charge_limit_low = 12100;        // Turn on charger if voltage drops below this value
   calvals.supply_voltage_charge_limit_high = 12300;       // Turn off charge when voltage goes over this value
   calvals.supply_voltage_bms_open_threshold = 11000;      // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
-  calvals.motor_amps_limit = 80;                          // If we see a current this high, we'll go into no-movement mode
-  calvals.wind_speed_limit = 5;                                       // Above this wind speed, in knots, we will lower the panels
+  calvals.motor_amps_limit = 90;                          // If we see a current this high, we'll go into no-movement mode
+  calvals.wind_speed_limit = 15;                          // Above this wind speed, in knots, we will lower the panels
   calvals.accumulated_motor_on_time_limit = MOTOR_MAX_ON_TIME_DEFAULT; // This is on-time in milliseconds, aged at 1/20th time
-  calvals.accumulated_motor_on_time_aging_rate = 20;                   // Sets ratio of maximum on time to off time (1:<this variable>)
-  calvals.backlight_on_time = DEFAULT_BACKLIGHT_ON_TIME;               // Number of seconds the LCD backlight stays on
+  calvals.accumulated_motor_on_time_aging_rate = 20;                 // Sets ratio of maximum on time to off time (1:<this variable>)
+  calvals.backlight_on_time = DEFAULT_BACKLIGHT_ON_TIME;             // Number of seconds the LCD backlight stays on
   calvals.operation_mode = time_mode;                                // Mode in which we should start operation
-  calvals.subversion = 6;
+  calvals.subversion = 12;
 }
 
 /*
@@ -430,38 +445,38 @@ void set_calvals_to_defaults()
 */
 #define MAX_CRON_STRING (60)
 
- 
-const char January[]   PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:00D";
-const char February[]  PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:30D";
-const char March[]     PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:45D";
-const char April[]     PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 18:00D";
-const char May[]       PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 18:00D";
-const char June[]      PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 18:30D";
-const char July[]      PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 18:20D";
-const char August[]    PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 18:00D";
-const char September[] PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:50D";
-const char October[]   PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:30D";
-const char November[]  PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:20D";
-const char December[]  PROGMEM = "9:00U10 10:00U10 12:00U30 13:00U10 17:00D";
+
+const char January[]   PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:00D";
+const char February[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:30D";
+const char March[]     PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:45D";
+const char April[]     PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 18:00D";
+const char May[]       PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:45D";
+const char June[]      PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 20:00D";
+const char July[]      PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:45D";
+const char August[]    PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:30D";
+const char September[] PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:50D";
+const char October[]   PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:30D";
+const char November[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:20D";
+const char December[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:00D";
 
 const char *const cron_table[] PROGMEM = {
- January, February, March, April, May, June, July, August, September, October, November, December
+  January, February, March, April, May, June, July, August, September, October, November, December
 };
 
 char todays_cron_string[MAX_CRON_STRING];
 char *current_cron_p = NULL;
 
 /*
- * When this is non-zero, do not let the normal update happen to the LCD so that the value the user
- * wanted to see stays on the display for some number of seconds (like 10).
- */
+   When this is non-zero, do not let the normal update happen to the LCD so that the value the user
+   wanted to see stays on the display for some number of seconds (like 10).
+*/
 char vtd_timeout = 0;
 
 /*
    Called every second the backlight is on and turns off the backlight, and disables itself, when the backlight timer
    has counted down to zero.
 */
-void monitor_lcd_backlight_callback()
+void monitor_lcd_backlight_callback(void)
 {
   if (backlight_timer > 0) {
     backlight_timer--;
@@ -475,13 +490,14 @@ void monitor_lcd_backlight_callback()
   }
 }
 
-enum val_to_display_e { vtd_none = 0, vtd_max_4V_current, vtd_voltage, vtd_build_date, vtd_build_time, vtd_time, vtd_mode, vtd_position, vtd_sunlow, vtd_sunhigh, 
-vtd_temperature,  vtd_motor_on_time, vtd_max_knots, vtd_position_upper_limit, 
-vtd_position_lower_limit, vtd_time_tilted_up_limit_in_minutes, vtd_darkness_threshold, vtd_battery_charging_temperature_limit, vtd_motor_amps_limit, 
-vtd_wind_speed_limit, vtd_accumulated_motor_on_time_limit,vtd_accumulated_motor_on_time_aging_rate, vtd_backlight_on_time, vtd_last} vtd_current = vtd_none;
+enum val_to_display_e { vtd_none = 0, vtd_max_4V_current, vtd_temperature, vtd_voltage, vtd_build_date, vtd_build_time, vtd_time, vtd_mode, vtd_position, vtd_sunlow, vtd_sunhigh,
+                        vtd_motor_on_time, vtd_max_knots, vtd_position_upper_limit,
+                        vtd_position_lower_limit, vtd_time_tilted_up_limit_in_minutes, vtd_darkness_threshold, vtd_battery_charging_temperature_limit, vtd_motor_amps_limit,
+                        vtd_wind_speed_limit, vtd_accumulated_motor_on_time_limit, vtd_accumulated_motor_on_time_aging_rate, vtd_backlight_on_time, vtd_last
+                      } vtd_current = vtd_none;
 
 
-void vtd_display_current()
+void vtd_display_current(void)
 {
   vtd_timeout = 10;
   char bytes = 0;
@@ -491,7 +507,7 @@ void vtd_display_current()
       vtd_timeout = 0;
       bytes = 16;
       break;
-      
+
     case vtd_build_date:
       lcd.print(F("Build date      "));
       lcd.setCursor(0, 1);
@@ -503,7 +519,7 @@ void vtd_display_current()
       lcd.setCursor(0, 1);
       bytes = lcd.print(build_time);
       break;
-      
+
     case vtd_time:
       lcd.print(F("Date   Time   "));
       lcd.setCursor(0, 1);
@@ -516,34 +532,34 @@ void vtd_display_current()
       lcd.print(minute(arduino_time));
       lcd.write(':');
       lcd.print(second(arduino_time));
-     
+
       bytes = 15;
       break;
-      
+
     case vtd_mode:
       lcd.print(F("Operating Mode  "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(operation_mode_string());
       break;
-      
+
     case vtd_position:
       lcd.print(F("Panel Position   "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(position_sensor_val);
       break;
-      
+
     case vtd_sunlow:
       lcd.print(F("Lower sun sensor"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(lower_solar_val);
       break;
-      
+
     case vtd_sunhigh:
       lcd.print(F("Upper sun sensor"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(upper_solar_val);
       break;
-      
+
     case vtd_voltage:
       lcd.print(F("Supply Voltage  "));
       lcd.setCursor(0, 1);
@@ -551,57 +567,57 @@ void vtd_display_current()
       bytes += lcd.print(F("."));
       bytes += lcd.print(supply_voltage % 1000);
       break;
-      
+
     case vtd_temperature:
       lcd.print(F("Battery Temperat"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(battery_temperature_F) + 1;
       lcd.write('F');
       break;
-      
+
     case vtd_max_4V_current:
       lcd.print(F("Max Motor Amps  "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(max_4V_current_amps);
       break;
-      
+
     case vtd_motor_on_time:
       lcd.print(F("Motor-on time   "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(accumulated_motor_on_time);
       break;
-      
+
     case vtd_max_knots:
       lcd.print(F("Max windspeed KT"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(max_wind_speed_knots);
       break;
-      
+
     case vtd_position_upper_limit:
       lcd.print(F("Pos upper limit "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.position_upper_limit);
       break;
-      
+
     case vtd_position_lower_limit:
       lcd.print(F("Pos lower limit"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.position_lower_limit);
       break;
-   
+
     case vtd_time_tilted_up_limit_in_minutes:
       lcd.print(F("Time tilted up limit"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.time_tilted_up_limit_in_minutes);
       lcd.print(F(" min"));
       break;
-      
+
     case vtd_darkness_threshold:
       lcd.print(F("Darkness thresh"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.darkness_threshold);
       break;
-      
+
     case vtd_battery_charging_temperature_limit:
       lcd.print(F("Charging temp limit"));
       lcd.setCursor(0, 1);
@@ -613,31 +629,31 @@ void vtd_display_current()
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.motor_amps_limit);
       break;
-      
+
     case vtd_wind_speed_limit:
       lcd.print(F("Wind speed limit"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.wind_speed_limit);
       break;
-      
+
     case vtd_accumulated_motor_on_time_limit:
       lcd.print(F("Accum motor limit"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.accumulated_motor_on_time_limit / 1000);
       break;
-      
+
     case vtd_accumulated_motor_on_time_aging_rate:
       lcd.print(F("Accum aging rate "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.accumulated_motor_on_time_aging_rate);
       break;
-      
+
     case vtd_backlight_on_time:
       lcd.print(F("Backlight time   "));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.backlight_on_time);
       break;
-    
+
     default:
       fail("vtd");
       break;
@@ -662,68 +678,68 @@ void monitor_buttons_callback()
     if (buttons & (BUTTON_UP | BUTTON_DOWN)) {
       int delta = (buttons & BUTTON_UP) ? 1 : -1;
       switch (vtd_current) {
-      case vtd_mode:
-        if (buttons & BUTTON_UP) {
-          if (calvals.operation_mode < sensor_mode) {
-            calvals.operation_mode = (enum mode_e)((int)calvals.operation_mode + 1);
+        case vtd_mode:
+          if (buttons & BUTTON_UP) {
+            if (calvals.operation_mode < sensor_mode) {
+              calvals.operation_mode = (enum mode_e)((int)calvals.operation_mode + 1);
+            }
+          } else {
+            if (calvals.operation_mode > no_panel_movement_mode) {
+              calvals.operation_mode = (enum mode_e)((int)calvals.operation_mode - 1);
+            }
           }
-        } else {
-          if (calvals.operation_mode > no_panel_movement_mode) {
-            calvals.operation_mode = (enum mode_e)((int)calvals.operation_mode - 1);
-          }
-        }
-        break;
-      
-      case vtd_position_upper_limit:
-        calvals.position_upper_limit += delta;
-        break;
-      
-      case vtd_position_lower_limit:
-        calvals.position_lower_limit += delta;
-        break;
-     
-      case vtd_time_tilted_up_limit_in_minutes:
-        calvals.time_tilted_up_limit_in_minutes += delta;
-        break;
-        
-      case vtd_darkness_threshold:
-        calvals.darkness_threshold += delta;
-        break;
-      
-      case vtd_battery_charging_temperature_limit:
-        calvals.battery_charging_temperature_limit += delta;
-        break;
+          break;
 
-      case vtd_motor_amps_limit:
-        calvals.motor_amps_limit += delta;
-        break;
-      
-      case vtd_wind_speed_limit:
-        calvals.wind_speed_limit += delta;
-        break;
-      
-      case vtd_accumulated_motor_on_time_limit:
-        calvals.accumulated_motor_on_time_limit += delta * 1000;
-        break;
-      
-      case vtd_accumulated_motor_on_time_aging_rate:
-        calvals.accumulated_motor_on_time_aging_rate += delta;
-        break;
-      
-      case vtd_backlight_on_time:
-        calvals.backlight_on_time += delta;
-        break;
-        
+        case vtd_position_upper_limit:
+          calvals.position_upper_limit += delta;
+          break;
+
+        case vtd_position_lower_limit:
+          calvals.position_lower_limit += delta;
+          break;
+
+        case vtd_time_tilted_up_limit_in_minutes:
+          calvals.time_tilted_up_limit_in_minutes += delta;
+          break;
+
+        case vtd_darkness_threshold:
+          calvals.darkness_threshold += delta;
+          break;
+
+        case vtd_battery_charging_temperature_limit:
+          calvals.battery_charging_temperature_limit += delta;
+          break;
+
+        case vtd_motor_amps_limit:
+          calvals.motor_amps_limit += delta;
+          break;
+
+        case vtd_wind_speed_limit:
+          calvals.wind_speed_limit += delta;
+          break;
+
+        case vtd_accumulated_motor_on_time_limit:
+          calvals.accumulated_motor_on_time_limit += delta * 1000;
+          break;
+
+        case vtd_accumulated_motor_on_time_aging_rate:
+          calvals.accumulated_motor_on_time_aging_rate += delta;
+          break;
+
+        case vtd_backlight_on_time:
+          calvals.backlight_on_time += delta;
+          break;
+
       }
       vtd_display_current();
     }
-    
+
     if (buttons & BUTTON_LEFT) {
       if (vtd_current > vtd_none) {
         vtd_current = (enum val_to_display_e)((int)vtd_current - 1);
         vtd_display_current();
       }
-      
+
     }
     if (buttons & BUTTON_RIGHT) {
       vtd_current = (enum val_to_display_e)((int)vtd_current + 1);
@@ -732,7 +748,7 @@ void monitor_buttons_callback()
       }
       vtd_display_current();
     }
-    
+
     if (buttons & BUTTON_SELECT) {
 
     }
@@ -740,19 +756,21 @@ void monitor_buttons_callback()
 }
 
 /*
- *  Turn off both relays that drive 12VDC to the contactor inputs.  Since we aren't driving
- *  the panels, we also disable the task that monitors position and estimated temperature limits
- */
+    Turn off both relays that drive 12VDC to the contactor inputs.  Since we aren't driving
+    the panels, we also disable the task that monitors position and estimated temperature limits
+*/
 void stop_driving_panels(void)
 {
-  digitalWrite(REL1, LOW); // Turn off go-up relay
-  digitalWrite(REL2, LOW); // Turn off go-down relay
+  quad_relay.turnRelayOff(1);
+  quad_relay.turnRelayOff(2);
+  //digitalWrite(REL1, LOW); // Turn off go-up relay
+  //digitalWrite(REL2, LOW); // Turn off go-down relay
   panels_going_down = false;
   panels_going_up = false;
   monitor_position_limits.disable();
   monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
-  
-  monitor_upward_moving_panels_and_stop_when_time_elapsed.disable();  
+
+  monitor_upward_moving_panels_and_stop_when_time_elapsed.disable();
   lcd.setCursor(0, 1);
   lcd.print(F("Stopped "));
   lcd.print(position_sensor_val);
@@ -780,10 +798,11 @@ void fail(const char *fail_message)
   abort();
 }
 
+#ifdef RS485
 /*
- * Set when we have enabled the Arduino serial output (from its UART) to drive the RS-485 line.  Most of the time, this is not
- * set.  This allows us to listen for characters from the other side.  We only set this when we need to send characters.
- */
+   Set when we have enabled the Arduino serial output (from its UART) to drive the RS-485 line.  Most of the time, this is not
+   set.  This allows us to listen for characters from the other side.  We only set this when we need to send characters.
+*/
 bool txenabled;
 
 /*
@@ -792,8 +811,8 @@ bool txenabled;
 */
 void enable_rs485_output()
 {
-  if (UCSR0A |(1 << TXC0)) {
-  //  fail("enable485");
+  if (UCSR0A | (1 << TXC0)) {
+    //  fail("enable485");
   }
   digitalWrite(TXEN, HIGH);   //Enable Transmit
   delay(1);                   //Let 485 chip go into Transmit Mode
@@ -811,6 +830,7 @@ void disable_rs485_output()
   digitalWrite(TXEN, LOW);              //Turn off transmit enable
   txenabled = false;
 }
+#endif
 
 /*
    Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
@@ -821,7 +841,8 @@ void drive_panels_up(void)
   if (panels_going_down) {
     fail("drive_panels_up()");
   } else {
-    digitalWrite(REL1, HIGH); // Turn on go-up relay
+    quad_relay.turnRelayOn(1);
+    //digitalWrite(REL1, HIGH); // Turn on go-up relay
     lcd.setCursor(0, 1);
     lcd.print(F("Going up "));
     vtd_timeout = 10;
@@ -842,7 +863,8 @@ void drive_panels_down(void)
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
-    digitalWrite(REL2, HIGH); // Turn on go-down relay
+    quad_relay.turnRelayOn(2);
+    //digitalWrite(REL2, HIGH); // Turn on go-down relay
     panels_going_down = true;
     monitor_position_limits.enable();
   }
@@ -854,7 +876,8 @@ void drive_panels_down(void)
 */
 void turn_on_power_supply(void)
 {
-  digitalWrite(REL8, HIGH);
+  //digitalWrite(REL8, HIGH);
+  quad_relay.turnRelayOn(4);
   power_supply_on = true;
 }
 
@@ -864,7 +887,8 @@ void turn_on_power_supply(void)
 */
 void turn_off_power_supply(void)
 {
-  digitalWrite(REL8, LOW);
+  //digitalWrite(REL8, LOW);
+  quad_relay.turnRelayOff(3);
   power_supply_on = false;
 }
 
@@ -875,7 +899,7 @@ void turn_off_power_supply(void)
 void read_time_and_sensor_inputs_callback()
 {
   arduino_time = now();
-  
+
   supply_tap_voltage_raw = analogRead(ANIN4);
 
   /*
@@ -908,7 +932,7 @@ void read_time_and_sensor_inputs_callback()
   // Read the position sensor up to ten times with .5 second break in between readings to find a value
   // That is is in range.  Normally the first reading is in range and there is no .5 delay.  If after
   // ten tries, none are in range, set 'position_sensor_failed' to true
-  
+
   for (int i = 0 ; i < 10 ; i++) {
     position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
     if (position_sensor_val >= 10 && position_sensor_val <= 500) {
@@ -925,31 +949,28 @@ void read_time_and_sensor_inputs_callback()
   at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
   at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;
 
- /*
-  * Empirical correction from measurement at zero windspeed, means 'wind_speed_volts is zero at zero windspeed.
+  /*
+     Empirical correction from measurement at zero windspeed, means 'wind_speed_volts is zero at zero windspeed.
   */
-  wind_speed_raw = ads.readADC_SingleEnded(0) + 188;
+  wind_speed_raw = ads.readADC_SingleEnded(0);
   wind_speed_volts = ads.computeVolts(wind_speed_raw);
 
   /*
-   * I measured 0.40837V at zero windspeed.  From the Adafruit web site, the anenometer is supposed to generate
-   * a 2V signal at 50 meter/sec (or 97 knots) and 0.4V at 0 meters/sec.  97/(2.0 - 0.4) = 60.625
-   */
-  float knots = wind_speed_volts * 60.625;
-  if (knots >= 0.0) {
-    wind_speed_knots = knots;
+     I measured 0.41556V at zero windspeed.  From the Adafruit web site, the anenometer is supposed to generate
+     a 2V signal at 32.2 meter/sec (or 62.9 knots) and 0.4V at 0 meters/sec.  62.9/(2.0 - 0.4155) = 39.69
+  */
+  float knots = (wind_speed_volts - 0.4155) * 39.69;
+  if (knots < 0) {
+    wind_speed_knots = 0;
   } else {
-#if 0    
-    Serial.print(F("negative knots, wind_speed_raw= "));
-    Serial.print(wind_speed_raw);
-    Serial.print(F(" volts="));
-    Serial.println(wind_speed_volts);
-#endif    
-    knots = 0;
+    wind_speed_knots = knots;
+    if (wind_speed_knots > max_wind_speed_knots) {
+      max_wind_speed_knots = wind_speed_knots;
+    }
   }
 }
 
-void print2digits(int number) 
+void print2digits(int number)
 {
   if (number >= 0 && number < 10) {
     Serial.write('0');
@@ -981,7 +1002,7 @@ void display_status_on_lcd_callback()
       c1 = 'C';
     }
     bytes = lcd.print(c1);
-  
+
     char c2 = ' ';
     if (position_sensor_failed) {
       c2 = 'F';
@@ -991,17 +1012,20 @@ void display_status_on_lcd_callback()
       c2 = 'l';
     }
     bytes += lcd.print(c2);
-  
+
     char c3 = ' ';
     if (power_supply_on) {
       c3 = 'P';
     }
     bytes += lcd.print(c3);
-  
+
     bytes += lcd.print(F(" "));
     bytes += lcd.print(lower_solar_val);
     bytes += lcd.print(F(" "));
     bytes += lcd.print(upper_solar_val);
+    bytes += lcd.print(F(" "));
+    bytes += lcd.print(wind_speed_knots);
+
     while (bytes < 16) {
       bytes += lcd.print(F(" "));
     }
@@ -1043,7 +1067,7 @@ void print_in_three_columns_with_leading_zeroes(int val)
 /*
    This is the main system tracing function.  It emits a line of ASCII to the RS-485 line with lots of information.
    We display this information in a form that gnuplot(1) can readily absorb.
-   
+
    # Date Time   Mode Pos Lwr Uppr Volts Temp Amps MotOT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS
    Nov 17 17:15:54 2  137  11  10  12.80   77    0   0   1   0   1   0   1   0   0   0   0   0   0
    Nov 17 17:16:01 2  183  14  13  12.80   77    0   0   1   0   1   0   1   0   0   0   0   0   0
@@ -1051,19 +1075,19 @@ void print_in_three_columns_with_leading_zeroes(int val)
    Here is a gnuplot file that works to parse some of these lines where the text has been put in a file 'tracker.dat'.
    Still to do is to have gnuplot understand fields 13 through 22 (booleans from "Dark" to "Overcurrent").
 
-   
-set term png size 1500, 300
 
-set output 'tracker.png'
-set xdata time
-set timefmt "%b %d %H:%M:%S %Y"
-set ylabel "Position/Volts/Temperature/Knots"
-set yrange [-10:400]
-set xrange [*:*]
-set xlabel " "
-set grid
+  set term png size 1500, 300
 
-plot 'tracker.data' using 1:(($5*10))  t "Mode" with lines lc rgb "black", \
+  set output 'tracker.png'
+  set xdata time
+  set timefmt "%b %d %H:%M:%S %Y"
+  set ylabel "Position/Volts/Temperature/Knots"
+  set yrange [-10:400]
+  set xrange [*:*]
+  set xlabel " "
+  set grid
+
+  plot 'tracker.data' using 1:(($5*10))  t "Mode" with lines lc rgb "black", \
      'tracker.data' using 1:6          t "Position" with lines lc rgb "blue", \
      'tracker.data' using 1:7          t "Lower sensor" with lines lc rgb "red", \
      'tracker.data' using 1:8          t "Upper sensor" with lines lc rgb "green", \
@@ -1073,7 +1097,7 @@ plot 'tracker.data' using 1:(($5*10))  t "Mode" with lines lc rgb "black", \
      'tracker.data' using 1:12         t "Motor On Time" with lines lc rgb "red", \
      'tracker.data' using 1:(($23*10)) t "Windspeed (Knots/10)" with lines lc rgb "blue"
 
- */
+*/
 
 
 void print_status_to_rs485_callback(void)
@@ -1098,15 +1122,15 @@ void print_status_to_rs485_callback(void)
     Serial.write(':');
     print2digits(second(arduino_time));
     Serial.write(' ');
-    
+
     Serial.print(calvals.operation_mode);
-    
+
     Serial.write(' ');
     print_in_four_columns(position_sensor_val);
-   
+
     print_in_four_columns(lower_solar_val);
     print_in_four_columns(upper_solar_val);
-    
+
     print_in_four_columns(supply_voltage / 1000);
     Serial.write('.');
     print_in_three_columns_with_leading_zeroes(supply_voltage % 1000);
@@ -1114,14 +1138,14 @@ void print_status_to_rs485_callback(void)
 
     print_in_four_columns(battery_temperature_F);
     Serial.write(' ');
-#if 0    
+#if 0
     Serial.print(F("bat temp raw="));
     Serial.print(battery_temperature_volts_raw);
     Serial.print(F(" bat milli="));
     Serial.print(battery_temperature_millivolts);    // raw value converted to millivolts
     Serial.print(F(" C="));
-    Serial.print(battery_temperature_C_x10);  
-#endif    
+    Serial.print(battery_temperature_C_x10);
+#endif
 
 
     print_in_four_columns(current_sense_4V_amps);
@@ -1138,7 +1162,7 @@ void print_status_to_rs485_callback(void)
     print_in_four_columns(motor_overcurrent);
     Serial.write(' ');
     Serial.println(wind_speed_knots);
-#if 0    
+#if 0
     Serial.write(' ');
     Serial.print(wind_speed_volts);
 #endif
@@ -1149,8 +1173,8 @@ void print_status_to_rs485_callback(void)
 }
 
 /*
- *Check to see if the battery charger needs to be turned on or off.
- */
+  Check to see if the battery charger needs to be turned on or off.
+*/
 void control_battery_charger_callback()
 {
   if (supply_voltage < calvals.supply_voltage_charge_limit_low && battery_temperature_F <= calvals.battery_charging_temperature_limit) {
@@ -1190,18 +1214,18 @@ void control_battery_charger_callback()
 #define POSITION_HYSTERSIS (20)
 
 /*
- *   Check to see if the system has reached its high or low limits and stop the panels from moving if so.
- */
+     Check to see if the system has reached its high or low limits and stop the panels from moving if so.
+*/
 void monitor_position_limits_callback()
 {
   if (position_sensor_failed) {
     stop_driving_panels();
   } else {
-   if (panels_going_up && at_upper_position_limit && position_sensor_val > (calvals.position_upper_limit + POSITION_HYSTERSIS)) {
+    if (panels_going_up && at_upper_position_limit && position_sensor_val > (calvals.position_upper_limit + POSITION_HYSTERSIS)) {
       stop_driving_panels();
     }
     if (panels_going_down && at_lower_position_limit && position_sensor_val <= (calvals.position_lower_limit - POSITION_HYSTERSIS)) {
-     stop_driving_panels();
+      stop_driving_panels();
     }
   }
 }
@@ -1225,7 +1249,7 @@ void monitor_motor_on_time_callback()
     if (calvals.motor_amps_limit < current_sense_4V_amps) {
       stop_driving_panels();
       calvals.operation_mode = no_panel_movement_mode;
-      motor_overcurrent = true;      
+      motor_overcurrent = true;
     }
   } else {
     // For every second the motor is on, let it cool for a number of (configurable) seconds.
@@ -1262,8 +1286,8 @@ void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
 }
 
 /*
- * Number of seconds we are driving the panels up, only used in time_mode.
- */
+   Number of seconds we are driving the panels up, only used in time_mode.
+*/
 char seconds_left_driving_panel_up;
 
 /*
@@ -1306,8 +1330,8 @@ void control_hydraulics_callback()
       break;
 
     case time_mode:
-    //  Parse a cron string, example: "9:00U2 10:00U3 12:00U9 17:00D"
-      if (current_cron_p != NULL && *current_cron_p != '\0') {  
+      //  Parse a cron string, example: "9:00U2 10:00U3 12:00U9 17:00D"
+      if (current_cron_p != NULL && *current_cron_p != '\0') {
         int command_hour = atoi(current_cron_p);
         if (command_hour < 0 || command_hour > 24) {
           fail("h"); // Command hour of range
@@ -1318,21 +1342,21 @@ void control_hydraulics_callback()
         }
         minute_p++;
         int command_minute = atoi(minute_p);
-        if (command_minute < 0 || command_minute >59) {
+        if (command_minute < 0 || command_minute > 59) {
           fail("m"); // Command minute out of range
         }
-        if (hour(arduino_time) >= command_hour && minute(arduino_time) >= command_minute){
+        if (hour(arduino_time) >= command_hour && minute(arduino_time) >= command_minute) {
           Serial.print(F("Matching: "));
           Serial.println(current_cron_p);
-          
-          char *p = minute_p;   
+
+          char *p = minute_p;
           while (isdigit(*++p));    // Skip over digits in minutes field
           if (*p == '\0') {         // p should now point to the command character (U or D for now)
             fail("missing cmd");
           }
           switch (*p) {
             case 'U':
-              { 
+              {
                 seconds_left_driving_panel_up = atoi(p + 1);
                 if (seconds_left_driving_panel_up < 0 || seconds_left_driving_panel_up > 30) {
                   fail("seconds-to-run");
@@ -1351,7 +1375,7 @@ void control_hydraulics_callback()
               p++;
               if (!isdigit(*p)) {
                 fail("missing D");
-              }    
+              }
               current_cron_p = p;
               if (verbose > VERBOSE_NONE) {
                 Serial.print(F("Executing Up command for "));
@@ -1359,7 +1383,7 @@ void control_hydraulics_callback()
                 Serial.println(F(" seconds"));
               }
               break;
-              
+
             case 'D':
               // D should end the line
               if (*(p + 1) != '\0') {
@@ -1373,8 +1397,8 @@ void control_hydraulics_callback()
               }
               current_cron_p = p + 1;
               break;
-              
-            default: // Lots of debugging printfs that can be removed later.            
+
+            default: // Lots of debugging printfs that can be removed later.
               Serial.println(command_hour);
               Serial.println(command_minute);
               Serial.println(minute_p - current_cron_p);
@@ -1385,27 +1409,27 @@ void control_hydraulics_callback()
               break;
           }
         }
-      }    
+      }
       break;
 
     case sensor_mode:
-    {
-      // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
-      if (sun_high && at_upper_position_limit == false) {
-        if (time_of_first_raise == 0ULL) {
-          time_of_first_raise = time_now;
+      {
+        // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
+        if (sun_high && at_upper_position_limit == false) {
+          if (time_of_first_raise == 0ULL) {
+            time_of_first_raise = time_now;
+          }
+          drive_panels_up();
+          monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
         }
-        drive_panels_up();
-        monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
-      }
-      unsigned time_since_first_raise_in_minutes = ((time_now - time_of_first_raise) / 1000) / 60;
-      bool bedtime = (time_since_first_raise_in_minutes > calvals.time_tilted_up_limit_in_minutes) || dark;
-      if (panels_going_up == false && panels_going_down == false && bedtime) {
-        if (at_lower_position_limit == false) {
-          drive_panels_down();
+        unsigned time_since_first_raise_in_minutes = ((time_now - time_of_first_raise) / 1000) / 60;
+        bool bedtime = (time_since_first_raise_in_minutes > calvals.time_tilted_up_limit_in_minutes) || dark;
+        if (panels_going_up == false && panels_going_down == false && bedtime) {
+          if (at_lower_position_limit == false) {
+            drive_panels_down();
+          }
         }
       }
-    }
       break;
 
     default:
@@ -1415,8 +1439,8 @@ void control_hydraulics_callback()
 }
 
 /*
- * Set the global string pointer that keeps track of what the next time-command is that we should run.  
- */
+   Set the global string pointer that keeps track of what the next time-command is that we should run.
+*/
 void set_todays_cron_string()
 {
   strcpy_P(todays_cron_string, (char *)pgm_read_word(&(cron_table[month(arduino_time)])));  // Necessary casts and dereferencing, just copy.
@@ -1426,14 +1450,15 @@ void set_todays_cron_string()
 }
 
 /*
- * This is called every four hours.  It will do something (maybe more than once) in the early hours.
- */
+   This is called every four hours.  It will do something (maybe more than once) in the early hours.
+*/
 void monitor_cron_callback(void)
 {
   /*
-   * In the wee hours, set up the cron string for the next day
-   */
+     In the wee hours, set up the cron string for the next day
+  */
   if (hour(arduino_time) < 6) {
+    setup_time();
     set_todays_cron_string();
   }
 }
@@ -1470,10 +1495,11 @@ void write_calvals_to_eeprom()
   unsigned eeprom_crc_value = 0;
   unsigned calvals_crc_value = 0;
   struct calvals_s temp_calvals;
-
+#ifdef RS485
   if (txenabled == false) {
     fail("write_calvals..");
   }
+#endif
   int i;
   for (i = 0; i < sizeof(calvals) ; i++) {
     EEPROM.update(i, ((unsigned char *)&calvals)[i]);
@@ -1511,9 +1537,11 @@ void write_calvals_to_eeprom()
 */
 void print_calvals()
 {
+#ifdef RS485
   if (txenabled == false) {
     fail("print_calvals");
   }
+#endif
 
   Serial.print(F("Build date: "));
   Serial.println(build_date);
@@ -1564,9 +1592,11 @@ void read_calvals_from_eeprom(bool fix_if_checksum_fails)
   unsigned calvals_crc_value = 0;
   unsigned stored_eeprom_crc_value = 0;
   struct calvals_s temp_calvals;
+#ifdef RS485
   if (txenabled == false) {
     fail("read_calvals");
   }
+#endif
   /*
      Fetch the calvals structure from EEPROM and the stored CRC that follows it.
   */
@@ -1598,6 +1628,37 @@ void read_calvals_from_eeprom(bool fix_if_checksum_fails)
 }
 
 /*
+   Read the RTC chip and set the 'Arduino' time based on it.  We do this on system start and once per day.
+   The Arduino clock is not as accurate as the RTC.
+*/
+void setup_time(void)
+{
+  tmElements_t tm;
+
+  if (RTC.read(tm)) {
+    int dst_correction = 0;
+
+    if (tm.Month > 3 && tm.Month < 11) {
+      dst_correction = 1;
+    } else if (tm.Month == 3 && tm.Day >= 11) {
+      dst_correction = 1;
+    } else if (tm.Month == 11 && tm.Day < 6) {
+      dst_correction = 1;
+    }
+    setTime(tm.Hour + dst_correction, tm.Minute, tm.Second, tm.Day, tm.Month, tm.Year);
+    time_of_day_valid = true;
+  } else {
+    if (RTC.chipPresent()) {
+      Serial.println(F("The DS1307 is stopped.  Please run the SetTime"));
+      Serial.println(F("example to initialize the time and begin running."));
+      Serial.println();
+    } else {
+      Serial.println(F("DS1307 read error!  Please check the circuitry."));
+      Serial.println();
+    }
+  }
+}
+/*
    This is the function that the Arudino run time system calls once, just after start up.  We have to set the
    pin modes of the ATMEGA correctly as inputs or outputs.  We also fetch values from EEPROM for use during
    our operation and emit a startup message.
@@ -1606,22 +1667,24 @@ void setup()
 {
   analogReference(DEFAULT);
 
-  pinMode(REL1, OUTPUT);  // declare the relay pin as an output
-  pinMode(REL2, OUTPUT);  // declare the relay pin as an output
-  pinMode(REL8, OUTPUT);  // declare the relay pin as an output
+  //pinMode(REL1, OUTPUT);  // declare the relay pin as an output
+  //pinMode(REL2, OUTPUT);  // declare the relay pin as an output
+  //pinMode(REL8, OUTPUT);  // declare the relay pin as an output
 
-  pinMode(TXEN, OUTPUT);
+  //pinMode(TXEN, OUTPUT);
 
   // Set the working calibration values to the defaults that are in this file
   set_calvals_to_defaults();
 
-  Wire.begin();  
+  Wire.begin();
   lcd.begin(16, 2);
   lcd.print(F("Suntracker 1.0"));
   lcd.setCursor(0, 1);
   lcd.print(build_date);
 
-
+  if (!quad_relay.begin()) {
+    fail("REL");
+  }
 #ifdef SETTIME
   void setup_rtc();
   setup_rtc();
@@ -1651,29 +1714,13 @@ void setup()
   delay(INITIAL_DELAY);
 
   /*
-   * Set a valid initial value for lots of globals.  We need this in order to get the tm structure set,
-   * s that we can set today's cron string.  We need to do that before running in time_mode.
-   */
+     Set a valid initial value for lots of globals.  We need this in order to get the tm structure set,
+     s that we can set today's cron string.  We need to do that before running in time_mode.
+  */
   read_time_and_sensor_inputs_callback();
-  set_todays_cron_string();
 
-  {
-    tmElements_t tm;
-    
-    if (RTC.read(tm)) {
-      setTime(tm.Hour, tm.Minute, tm.Second, tm.Day, tm.Month, tm.Year);
-      time_of_day_valid = true;
-    } else {
-      if (RTC.chipPresent()) {
-        Serial.println(F("The DS1307 is stopped.  Please run the SetTime"));
-        Serial.println(F("example to initialize the time and begin running."));
-        Serial.println();
-      } else {
-        Serial.println(F("DS1307 read error!  Please check the circuitry."));
-        Serial.println();
-      }
-    }
-  }
+  setup_time();
+  set_todays_cron_string();
 }
 
 /*
@@ -1692,24 +1739,26 @@ void loop()
 */
 void monitor_rs485_input_callback()
 {
+#ifdef RS485
   if (txenabled == true) {
     fail("monitor_rs485...");
   }
+#endif
 }
 
-const char *operation_mode_string()
+const char *operation_mode_string(void)
 {
   switch (calvals.operation_mode) {
     case no_panel_movement_mode:
-      return("no-panel-movement");
+      return ("no-panel-movement");
       break;
 
     case time_mode:
-      return("time");
+      return ("time");
       break;
 
     case sensor_mode:
-      return("sensor");
+      return ("sensor");
       break;
 
     default:
@@ -1726,10 +1775,15 @@ void serialEvent()
 
   // This may fail, but I haven't see it fail yet.  I think it is just a matter of time, but in the meantime, I want
   // to ensure that the issues I am seeing are not due to entering this function with txenabled.
+#ifdef RS485
   if (txenabled == true) {
     fail("txenabled");
   }
+#endif
   char c = Serial.read();      // Get the waiting character
+  if (c == 0) {
+    return;
+  }
 
   switch (c) {
     case 'v':
@@ -1817,15 +1871,15 @@ void serialEvent()
     default:
       enable_rs485_output();
       Serial.print(F("Unrecog: "));
-      Serial.println(c & 0xff, HEX);
+      Serial.println(c, HEX);
       break;
   }
   disable_rs485_output();         //Turn off transmit enable
 }
 
 /*
- * If SETTIME is defined, we compile-in the code below to set the device's time to the build time.
- */
+   If SETTIME is defined, we compile-in the code below to set the device's time to the build time.
+*/
 #ifdef SETTIME
 
 
