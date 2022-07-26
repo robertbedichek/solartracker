@@ -4,8 +4,8 @@
    to get more power out of four LG Neon-2 420 Watt panels than if they were fixed-mounted.  A secondary goal is to
    have them better looking.  If they were fixed-mounted, they'd need to be reversed-racked, which is not a great look.
 
-    The core of the controls system is an Arduino:
-   KTA-223v3 by Ocean Controls www.oceancontrols.com.au
+    The core of the controls system is an Arduino: Sparkfun Redboard Qwiic 
+    with the Sparkfun 4-relay Qwiic, a 1307-based RTC, a 2x16 line LCD from Adafruit, and a 4-input I2C ADC.
 
    Creative Commons Licence
    Robert Bedichek
@@ -84,9 +84,15 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 // #define SETTIME
 
 /*
+ * Force 'Calvals' EEPROM value to be reloaded if non-zero, not if zero (normal case).  Needed when moving 'subversion' field.
+ */
+#define FORCE_CALVALS_RELOAD (1)
+
+
+/*
    Speed at which we run the serial connection (both via USB and RS-485)
 */
-#define SERIAL_BAUD (9600)
+#define SERIAL_BAUD (38400)
 
 /*
    Default number of seconds the backlight will stay on.
@@ -179,34 +185,6 @@ enum mode_e { no_panel_movement_mode, time_mode, sensor_mode, last_mode};
 // And for the output of a current sensor on the 4V line we use Arduino analog 3
 #define ANIN6 3
 
-/*
-    We use three relay outputs.  The first passes 12VDC when active to the go-up input of the contactor
-   that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
-   input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
-   hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
-   the panels to retain their position.  Before we had this check valve, they would gradually drift back to
-    the down position.  When we want the panels to lower, at the end of the day, we have to both release the
-   check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
-   by driving 12VDC to the "go-down" input of the contactor. The third relay we use is relay 8, which enables
-   120VAC or 220VAC to pass to a "wall-wart" style power supply that generates 12.3VDC @ 2A.  When our battery
-   voltage falls below 12.1VDC, we turn it on.  When it rises above 12.2VDC, we turn it off.
-*/
-
-// REL1 drives the go-up side of the contactor
-#define REL1 2  // Relay 1 is connected to Arduino Digital 2
-
-// REL2 drives the go-down side of the contactor
-#define REL2 3  // Relay 2 is connected to Arduino Digital 3 PWM
-
-
-// REL3 through REL6 are unused, but are available, in this design
-#define REL3 4  // Relay 3 is connected to Arduino Digital 4
-#define REL4 5  // Relay 4 is connected to Arduino Digital 5 PWM
-#define REL5 6  // Relay 5 is connected to Arduino Digital 6 PWM
-#define REL6 7  // Relay 6 is connected to Arduino Digital 7
-
-// Power supply input control
-#define REL7 8  // Relay 7 is connected to Arduino Digital 8
 
 
 void setup_time(void);
@@ -219,16 +197,24 @@ const char *operation_modestring(void);
 Scheduler ts;
 
 
-// REL8 controls the AC input of the power supply that charges the battery
-#define REL8 9  // Relay 8 is connected to Arduino Digital 9 PWM
-
-
 /*
-   We moved the transmit-enable to PB5/SCK as we are not using the SD interface, but we are using the built-in I2C interface.
-   We did this by removing D7 and replacing it with a new diode whose anode is on the SCK through-hole and who's cathode
-   is on the pad for D7's cathode.  The SPI interface must be off, (SPCR is 0), or else the SPI clock will be driven on this pin.
-*/
-#define TXEN 13
+ * Qwiic relay board.  Relay 3 is unused.
+ *
+    We use three relay outputs.  The first passes 12VDC when active to the go-up input of the contactor
+   that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
+   input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
+   hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
+   the panels to retain their position.  Before we had this check valve, they would gradually drift back to
+    the down position.  When we want the panels to lower, at the end of the day, we have to both release the
+   check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
+   by driving 12VDC to the "go-down" input of the contactor. The third relay we use is relay 4, which enables
+   120VAC or 220VAC to pass to a "wall-wart" style power supply that generates 12.3VDC @ 2A.  When our battery
+   voltage falls below 12.1VDC, we turn it on.  When it rises above 12.2VDC, we turn it off.
+ */
+#define RELAY_UP (1)
+#define RELAY_DOWN (3)
+#define RELAY_UNUSED (2)
+#define RELAY_POWER_SUPPLY (4)
 
 // #define TXEN 19 // RS-485 Transmit Enable is connected to Arduino Analog 5 which is Digital 19
 
@@ -241,9 +227,12 @@ char build_time[9] = __TIME__;
 
 /*
    These are values that may need to be tweaked.  They should be stored in EEPROM and changable through the RS-485
-   interface and possibly by a future keypad or other direct, at the device, interface.
+   interface and possibly by a future keypad or other direct, at the device, interface.  The first field, 'subversion', must
+   be the first element.  This is so that incrementing subversion will always cause a reload of the EEPROM version of the
+   calvals, even when fields are changed.
 */
 struct calvals_s {
+  int subversion;                                       // Changing this forces an calvals EEPROM reload
   unsigned position_upper_limit;                         // Max position value (i.e., fully tilted up)
   unsigned position_lower_limit;
   unsigned time_tilted_up_limit_in_minutes;                  // In minutes, Lower the panels after this many minutes, maximum.
@@ -253,15 +242,14 @@ struct calvals_s {
   unsigned supply_voltage_lower_limit;             // Below 11 volts, don't try to move panels other than lowering them.
   unsigned supply_voltage_charge_limit_low;        // Turn on charger if voltage drops below this value
   unsigned supply_voltage_charge_limit_high;       // Turn off charge when voltage goes over this value
-  unsigned supply_voltage_bms_open_threshold;      // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
-  unsigned motor_amps_limit;                         // If we see a current above this many amps, we will go into no-movement mode.
+  unsigned motor_amps_down_limit;                  // If we see a current above this many amps while lowering the panels, we will go into no-movement mode.
+  unsigned motor_amps_up_limit;                    // If we see a current above this many amps while raising the panels, we will go into no-movement mode.
 
   unsigned wind_speed_limit;                       // Above this speed, we will lower the panels
   unsigned long accumulated_motor_on_time_limit;        // This is on-time in milliseconds, aged at 1/20th time
   unsigned accumulated_motor_on_time_aging_rate;   // Sets ratio of maximum on time to off time (1:<this variable>)
   unsigned backlight_on_time;                           // Number of seconds the LCD backlight stays on
   enum mode_e operation_mode;                             // Mode to start in
-  int subversion;                                       // Changing this forces an calvals EEPROM reload
 } calvals;
 
 /*
@@ -313,6 +301,8 @@ unsigned upper_solar_val;  // Raw ADC values 0..1023 for 0..5V
 */
 unsigned position_sensor_val;// Raw ADC values 0..1023 for 0..5V
 bool position_sensor_failed = false;  // Set true if the position sensor value is ever out of range
+int position_difference;
+unsigned last_position_sensor_val;
 
 /*
    Record the time today when we first raised the panels.  This is used to decide, later in the day, that it must be
@@ -402,7 +392,7 @@ Task control_battery_charger(TASK_SECOND * 10, TASK_FOREVER, &control_battery_ch
 Task control_hydraulics(TASK_SECOND * 60, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
 Task monitor_upward_moving_panels_and_stop_when_sun_angle_correct(300, TASK_FOREVER, &monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback, &ts, false);
 
-Task monitor_position_limits(300, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
+Task monitor_position_limits(50, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
 Task monitor_motor_on_time(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_callback, &ts, true);
 Task monitor_rs485_input(100, TASK_FOREVER, &monitor_rs485_input_callback, &ts, true);
 
@@ -419,7 +409,7 @@ bool panels_going_down = false;
 void set_calvals_to_defaults()
 {
   calvals.position_upper_limit = 400;                          // Max position value (i.e., fully tilted up)
-  calvals.position_lower_limit = 112;
+  calvals.position_lower_limit = 110;
   calvals.time_tilted_up_limit_in_minutes = 10 * 60; // Lower the panels after 10 hours, maximum.
   calvals.darkness_threshold = 50;
 
@@ -427,14 +417,14 @@ void set_calvals_to_defaults()
   calvals.supply_voltage_lower_limit = 11000;             // Below 11 volts, don't try to move panels other than lowering them.
   calvals.supply_voltage_charge_limit_low = 12100;        // Turn on charger if voltage drops below this value
   calvals.supply_voltage_charge_limit_high = 12300;       // Turn off charge when voltage goes over this value
-  calvals.supply_voltage_bms_open_threshold = 11000;      // If we see a voltage this low, we assume the BMS has opened due to potential cell overcharge
-  calvals.motor_amps_limit = 90;                          // If we see a current this high, we'll go into no-movement mode
+  calvals.motor_amps_down_limit = 30;                          // If we see a current this high, we'll go into no-movement mode
+  calvals.motor_amps_up_limit = 60;                          // If we see a current this high, we'll go into no-movement mode
   calvals.wind_speed_limit = 15;                          // Above this wind speed, in knots, we will lower the panels
   calvals.accumulated_motor_on_time_limit = MOTOR_MAX_ON_TIME_DEFAULT; // This is on-time in milliseconds, aged at 1/20th time
   calvals.accumulated_motor_on_time_aging_rate = 20;                 // Sets ratio of maximum on time to off time (1:<this variable>)
   calvals.backlight_on_time = DEFAULT_BACKLIGHT_ON_TIME;             // Number of seconds the LCD backlight stays on
   calvals.operation_mode = time_mode;                                // Mode in which we should start operation
-  calvals.subversion = 12;
+  calvals.subversion = 17;
 }
 
 /*
@@ -443,21 +433,21 @@ void set_calvals_to_defaults()
    "U" there is optionaly the number of seconds to drive the panels up.  The default is one second.  We put this table in Flash,
    as we have plenty of program space (Flash), but are constrained by RAM.
 */
-#define MAX_CRON_STRING (60)
+#define MAX_CRON_STRING (65)
 
 
-const char January[]   PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:00D";
-const char February[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:30D";
-const char March[]     PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:45D";
-const char April[]     PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 18:00D";
-const char May[]       PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:45D";
-const char June[]      PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 20:00D";
-const char July[]      PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:45D";
-const char August[]    PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 14:00U5 19:30D";
-const char September[] PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:50D";
-const char October[]   PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:30D";
-const char November[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:20D";
-const char December[]  PROGMEM = "9:00U2 10:00U2 12:00U5 13:00U5 17:00D";
+const char January[]   PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:00D";
+const char February[]  PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:00D";
+const char March[]     PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:00D";
+const char April[]     PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 19:45D";
+const char May[]       PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 20:00D";
+const char June[]      PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 20:15D";
+const char July[]      PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 20:15D";
+const char August[]    PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 20:00D";
+const char September[] PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 19:45D";
+const char October[]   PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:30D";
+const char November[]  PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:00D";
+const char December[]  PROGMEM = "11:00U4 12:00U6 13:00U6 14:00U6 15:00U6 16:00U10 17:00U10 18:00D";
 
 const char *const cron_table[] PROGMEM = {
   January, February, March, April, May, June, July, August, September, October, November, December
@@ -627,7 +617,9 @@ void vtd_display_current(void)
     case vtd_motor_amps_limit:
       lcd.print(F("Motor amps limit  "));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(calvals.motor_amps_limit);
+      bytes = lcd.print(calvals.motor_amps_down_limit);
+      bytes += lcd.print(F(" "));
+      bytes += lcd.print(calvals.motor_amps_up_limit);
       break;
 
     case vtd_wind_speed_limit:
@@ -711,7 +703,7 @@ void monitor_buttons_callback()
           break;
 
         case vtd_motor_amps_limit:
-          calvals.motor_amps_limit += delta;
+          calvals.motor_amps_up_limit += delta;
           break;
 
         case vtd_wind_speed_limit:
@@ -761,16 +753,16 @@ void monitor_buttons_callback()
 */
 void stop_driving_panels(void)
 {
-  quad_relay.turnRelayOff(1);
-  quad_relay.turnRelayOff(2);
-  //digitalWrite(REL1, LOW); // Turn off go-up relay
-  //digitalWrite(REL2, LOW); // Turn off go-down relay
+  Serial.println(F("# stop_driving_panels()"));
+  quad_relay.turnRelayOff(RELAY_UP);
+  quad_relay.turnRelayOff(RELAY_DOWN);
   panels_going_down = false;
   panels_going_up = false;
   monitor_position_limits.disable();
   monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
 
   monitor_upward_moving_panels_and_stop_when_time_elapsed.disable();
+  print_status_to_rs485.setInterval(10 * TASK_SECOND);
   lcd.setCursor(0, 1);
   lcd.print(F("Stopped "));
   lcd.print(position_sensor_val);
@@ -785,9 +777,9 @@ void fail(const char *fail_message)
 {
   stop_driving_panels();
   enable_rs485_output();
-  Serial.print(F("todays_cron_string:"));
+  Serial.print(F("#todays_cron_string:"));
   Serial.println(todays_cron_string);
-  Serial.print(F("current_cron_p: "));
+  Serial.print(F("#current_cron_p: "));
   Serial.println(current_cron_p);
   Serial.println(fail_message);
 
@@ -841,13 +833,13 @@ void drive_panels_up(void)
   if (panels_going_down) {
     fail("drive_panels_up()");
   } else {
-    quad_relay.turnRelayOn(1);
-    //digitalWrite(REL1, HIGH); // Turn on go-up relay
+    quad_relay.turnRelayOn(RELAY_UP);
     lcd.setCursor(0, 1);
     lcd.print(F("Going up "));
     vtd_timeout = 10;
     panels_going_up = true;
     monitor_position_limits.enable();
+    print_status_to_rs485.setInterval(200);
   }
 }
 
@@ -860,13 +852,14 @@ void drive_panels_down(void)
   if (panels_going_up) {
     fail("drive_panels_down");
   } else {
+    Serial.print(F("retract panels"));
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
-    quad_relay.turnRelayOn(2);
-    //digitalWrite(REL2, HIGH); // Turn on go-down relay
+    quad_relay.turnRelayOn(RELAY_DOWN);
     panels_going_down = true;
     monitor_position_limits.enable();
+    print_status_to_rs485.setInterval(200);
   }
 }
 
@@ -876,8 +869,7 @@ void drive_panels_down(void)
 */
 void turn_on_power_supply(void)
 {
-  //digitalWrite(REL8, HIGH);
-  quad_relay.turnRelayOn(4);
+  quad_relay.turnRelayOn(RELAY_POWER_SUPPLY);
   power_supply_on = true;
 }
 
@@ -887,8 +879,7 @@ void turn_on_power_supply(void)
 */
 void turn_off_power_supply(void)
 {
-  //digitalWrite(REL8, LOW);
-  quad_relay.turnRelayOff(3);
+  quad_relay.turnRelayOff(RELAY_POWER_SUPPLY);
   power_supply_on = false;
 }
 
@@ -925,8 +916,8 @@ void read_time_and_sensor_inputs_callback()
       The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
       have more stable values average the last reading with this reading (and the 'last reading' is a running average)
   */
-  lower_solar_val = (analogRead(ANIN1) + lower_solar_val) / 2;
-  upper_solar_val = (analogRead(ANIN2) + upper_solar_val) / 2;
+  lower_solar_val = (ads.readADC_SingleEnded(1) + lower_solar_val) / 2;
+  upper_solar_val = (ads.readADC_SingleEnded(2) + upper_solar_val) / 2;
   position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
 
   // Read the position sensor up to ten times with .5 second break in between readings to find a value
@@ -1068,7 +1059,7 @@ void print_in_three_columns_with_leading_zeroes(int val)
    This is the main system tracing function.  It emits a line of ASCII to the RS-485 line with lots of information.
    We display this information in a form that gnuplot(1) can readily absorb.
 
-   # Date Time   Mode Pos Lwr Uppr Volts Temp Amps MotOT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS
+   # Date Time   Mode Pos Diff Lwr Uppr Volts Temp Amps MotOT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS
    Nov 17 17:15:54 2  137  11  10  12.80   77    0   0   1   0   1   0   1   0   0   0   0   0   0
    Nov 17 17:16:01 2  183  14  13  12.80   77    0   0   1   0   1   0   1   0   0   0   0   0   0
 
@@ -1105,9 +1096,12 @@ void print_status_to_rs485_callback(void)
   static char line_counter = 0;
 
   if (verbose > VERBOSE_NONE) {
+    position_difference = (int)last_position_sensor_val - (int)position_sensor_val;
+    last_position_sensor_val = position_sensor_val;
+
     enable_rs485_output();
     if (line_counter == 0) {
-      Serial.println(F("# Date Time   Mode Pos Lwr Uppr Volts  Temp Amps MotOT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS"));
+      Serial.println(F("# Date Time   Mode Pos Diff Lwr Uppr Volts  Temp Amps MotOT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -1127,6 +1121,8 @@ void print_status_to_rs485_callback(void)
 
     Serial.write(' ');
     print_in_four_columns(position_sensor_val);
+    Serial.write(' ');
+    print_in_four_columns(position_difference);
 
     print_in_four_columns(lower_solar_val);
     print_in_four_columns(upper_solar_val);
@@ -1153,20 +1149,15 @@ void print_status_to_rs485_callback(void)
     print_in_four_columns(dark);
     print_in_four_columns(sun_high);
     print_in_four_columns(sun_low);
-    print_in_four_columns(at_upper_position_limit);
+    print_in_four_columns(at_upper_position_limit);  
     print_in_four_columns(at_lower_position_limit);
     print_in_four_columns(panels_going_up);
     print_in_four_columns(panels_going_down);
     print_in_four_columns(power_supply_on);
     print_in_four_columns(motor_cooling_off);
     print_in_four_columns(motor_overcurrent);
-    Serial.write(' ');
-    Serial.println(wind_speed_knots);
-#if 0
-    Serial.write(' ');
-    Serial.print(wind_speed_volts);
-#endif
-
+    print_in_four_columns(wind_speed_knots);
+    Serial.println();
 
     disable_rs485_output();
   }
@@ -1178,53 +1169,30 @@ void print_status_to_rs485_callback(void)
 void control_battery_charger_callback()
 {
   if (supply_voltage < calvals.supply_voltage_charge_limit_low && battery_temperature_F <= calvals.battery_charging_temperature_limit) {
-
-    /*
-       If the power supply was already on and the voltage is really low, then
-       we conclude that the BMS opened because our charge limit range was too high.
-       In this case, we lower the the charge limit range unless the upper limit is
-       already below 12 volts.
-    */
-    if (power_supply_on && supply_voltage < calvals.supply_voltage_bms_open_threshold) {
-      if (calvals.supply_voltage_charge_limit_high > 12000) {
-        enable_rs485_output();
-        Serial.print(F("BMS open?  supply_voltage: "));
-        Serial.println(supply_voltage);
-
-        /*
-           Move the charge range down 10 millivolts
-        */
-        calvals.supply_voltage_charge_limit_high -= 10;
-        calvals.supply_voltage_charge_limit_low -= 10;
-        Serial.print(F(" reducing supply_voltage_charge_limit_high: "));
-        Serial.print(calvals.supply_voltage_charge_limit_high);
-        Serial.print(F(" and supply_voltage_charge_limit_low: "));
-        Serial.print(calvals.supply_voltage_charge_limit_low);
-        disable_rs485_output();
-        turn_off_power_supply();
-      }
-    } else {   // Turn on power supply to charge our batteries
-      turn_on_power_supply();
-    }
-  } else if (supply_voltage > calvals.supply_voltage_charge_limit_high) {
+    turn_on_power_supply();
+  } else if (supply_voltage > calvals.supply_voltage_charge_limit_high || battery_temperature_F > calvals.battery_charging_temperature_limit) {
     turn_off_power_supply();
   }
 }
 
-#define POSITION_HYSTERSIS (20)
+#define POSITION_HYSTERSIS (1)
 
 /*
      Check to see if the system has reached its high or low limits and stop the panels from moving if so.
 */
+
 void monitor_position_limits_callback()
 {
   if (position_sensor_failed) {
+    Serial.print(F("position_sensor_failed"));
     stop_driving_panels();
   } else {
     if (panels_going_up && at_upper_position_limit && position_sensor_val > (calvals.position_upper_limit + POSITION_HYSTERSIS)) {
+      Serial.print(F("# stop panels going up"));
       stop_driving_panels();
     }
     if (panels_going_down && at_lower_position_limit && position_sensor_val <= (calvals.position_lower_limit - POSITION_HYSTERSIS)) {
+      Serial.print(F("# stop panels going down"));
       stop_driving_panels();
     }
   }
@@ -1246,7 +1214,12 @@ void monitor_motor_on_time_callback()
 
   if (panels_going_up || panels_going_down) {
     accumulated_motor_on_time += time_elapsed;
-    if (calvals.motor_amps_limit < current_sense_4V_amps) {
+    if (panels_going_up && calvals.motor_amps_up_limit < current_sense_4V_amps) {
+      stop_driving_panels();
+      calvals.operation_mode = no_panel_movement_mode;
+      motor_overcurrent = true;
+    }
+    if (panels_going_down && calvals.motor_amps_down_limit < current_sense_4V_amps) {
       stop_driving_panels();
       calvals.operation_mode = no_panel_movement_mode;
       motor_overcurrent = true;
@@ -1330,83 +1303,103 @@ void control_hydraulics_callback()
       break;
 
     case time_mode:
-      //  Parse a cron string, example: "9:00U2 10:00U3 12:00U9 17:00D"
-      if (current_cron_p != NULL && *current_cron_p != '\0') {
-        int command_hour = atoi(current_cron_p);
-        if (command_hour < 0 || command_hour > 24) {
-          fail("h"); // Command hour of range
-        }
-        char *minute_p = strchr(current_cron_p, ':');
-        if (minute_p == NULL) {
-          fail("c"); // Missing minute
-        }
-        minute_p++;
-        int command_minute = atoi(minute_p);
-        if (command_minute < 0 || command_minute > 59) {
-          fail("m"); // Command minute out of range
-        }
-        if (hour(arduino_time) >= command_hour && minute(arduino_time) >= command_minute) {
-          Serial.print(F("Matching: "));
-          Serial.println(current_cron_p);
-
-          char *p = minute_p;
-          while (isdigit(*++p));    // Skip over digits in minutes field
-          if (*p == '\0') {         // p should now point to the command character (U or D for now)
-            fail("missing cmd");
+      if (time_of_day_valid) {
+        //  Parse a cron string, example: "9:00U2 10:00U3 12:00U9 17:00D"
+        if (current_cron_p != NULL && *current_cron_p != '\0') {
+          int command_hour = atoi(current_cron_p);
+          if (command_hour < 0 || command_hour > 24) {
+            fail("h"); // Command hour of range
           }
-          switch (*p) {
-            case 'U':
-              {
-                seconds_left_driving_panel_up = atoi(p + 1);
-                if (seconds_left_driving_panel_up < 0 || seconds_left_driving_panel_up > 30) {
-                  fail("seconds-to-run");
+          char *minute_p = strchr(current_cron_p, ':');
+          if (minute_p == NULL) {
+            fail("c"); // Missing minute
+          }
+          minute_p++;
+          int command_minute = atoi(minute_p);
+          if (command_minute < 0 || command_minute > 59) {
+            fail("m"); // Command minute out of range
+          }
+          /* If command time is in past, advance our pointer to the next record.
+           *  This can happen when the controller restarts
+           */
+          while (hour(arduino_time) > command_hour || (hour(arduino_time) == command_hour && minute(arduino_time) > command_minute)) {
+            // Skip over the current time/command record by looking for the next whitespace or end of line
+            while (*minute_p != '\0' && !isspace(*minute_p)) {
+              minute_p++;
+            }
+            current_cron_p = minute_p;
+            // If we are not at the end of the line, skip over the white space
+            if (isspace(*current_cron_p)) {
+              current_cron_p++;
+            }
+            Serial.print(F("#Advancing command_cron_p, now="));
+            Serial.println(current_cron_p);
+            break;
+          }
+          
+          if (hour(arduino_time) == command_hour && minute(arduino_time) == command_minute) {
+            Serial.print(F("# Matching: "));
+            Serial.println(current_cron_p);
+  
+            char *p = minute_p;
+            while (isdigit(*++p));    // Skip over digits in minutes field
+            if (*p == '\0') {         // p should now point to the command character (U or D for now)
+              fail("missing cmd");
+            }
+            switch (*p) {
+              case 'U':
+                {
+                  seconds_left_driving_panel_up = atoi(p + 1);
+                  if (seconds_left_driving_panel_up < 0 || seconds_left_driving_panel_up > 30) {
+                    fail("seconds-to-run");
+                  }
+                  if (!at_upper_position_limit) {
+                    drive_panels_up();
+                    monitor_upward_moving_panels_and_stop_when_time_elapsed.enable();
+                  }
                 }
-                if (!at_upper_position_limit) {
-                  drive_panels_up();
-                  monitor_upward_moving_panels_and_stop_when_time_elapsed.enable();
+                while (*p != '\0' && !isspace(*p)) {
+                  p++;
                 }
-              }
-              while (*p != '\0' && !isspace(*p)) {
+                if (*p == '\0') {
+                  fail("D"); // Missing 'D'
+                }
                 p++;
-              }
-              if (*p == '\0') {
-                fail("D"); // Missing 'D'
-              }
-              p++;
-              if (!isdigit(*p)) {
-                fail("missing D");
-              }
-              current_cron_p = p;
-              if (verbose > VERBOSE_NONE) {
-                Serial.print(F("Executing Up command for "));
-                Serial.print((unsigned)seconds_left_driving_panel_up);
-                Serial.println(F(" seconds"));
-              }
-              break;
-
-            case 'D':
-              // D should end the line
-              if (*(p + 1) != '\0') {
-                fail("garbage");
-              }
-              if (verbose > VERBOSE_NONE) {
-                Serial.print(F("Executing D command"));
-              }
-              if (!at_lower_position_limit) {
-                drive_panels_down();
-              }
-              current_cron_p = p + 1;
-              break;
-
-            default: // Lots of debugging printfs that can be removed later.
-              Serial.println(command_hour);
-              Serial.println(command_minute);
-              Serial.println(minute_p - current_cron_p);
-              Serial.println(p - minute_p);
-              Serial.println(minute_p);
-              Serial.println(p);
-              fail("unknown command");
-              break;
+                if (!isdigit(*p)) {
+                  fail("missing D");
+                }
+                current_cron_p = p;
+                if (verbose > VERBOSE_NONE) {
+                  Serial.print(F("#Executing Up command for "));
+                  Serial.print((unsigned)seconds_left_driving_panel_up);
+                  Serial.println(F(" seconds"));
+                }
+                break;
+  
+              case 'D':
+                // D should end the line
+                if (*(p + 1) != '\0') {
+                  fail("garbage");
+                }
+                if (verbose > VERBOSE_NONE) {
+                  Serial.print(F("# Executing D command"));
+                }
+                if (!at_lower_position_limit) {
+                  drive_panels_down();
+                }
+                current_cron_p = p + 1;
+                break;
+  
+              default: // Lots of debugging printfs that can be removed later.
+                Serial.println(command_hour);
+                Serial.println(command_minute);
+                Serial.println(minute_p - current_cron_p);
+                Serial.println(p - minute_p);
+                Serial.println(minute_p);
+                Serial.println(p);
+                fail("unknown command");
+                break;
+            }
           }
         }
       }
@@ -1443,10 +1436,12 @@ void control_hydraulics_callback()
 */
 void set_todays_cron_string()
 {
-  strcpy_P(todays_cron_string, (char *)pgm_read_word(&(cron_table[month(arduino_time)])));  // Necessary casts and dereferencing, just copy.
-  current_cron_p = todays_cron_string;
-  Serial.print(F("set_todays_cron_string(): "));
-  Serial.println(current_cron_p);
+  if (time_of_day_valid) {
+    strcpy_P(todays_cron_string, (char *)pgm_read_word(&(cron_table[month(arduino_time) - 1])));  // Necessary casts and dereferencing, just copy.
+    current_cron_p = todays_cron_string;
+    Serial.print(F("#"));
+    Serial.println(current_cron_p);
+  }
 }
 
 /*
@@ -1455,7 +1450,9 @@ void set_todays_cron_string()
 void monitor_cron_callback(void)
 {
   /*
-     In the wee hours, set up the cron string for the next day
+   * When the controller restarts, arduino_time will be just a few seconds and we will execute the body  
+   * of this "if".  After that, in the wee hours, it will also executes.
+   * The body copies the RTC to 'arduino_time' and it set up the cron string for the day
   */
   if (hour(arduino_time) < 6) {
     setup_time();
@@ -1515,7 +1512,7 @@ void write_calvals_to_eeprom()
   for (int i = 0; i < sizeof(calvals) ; i++) {
     if (((unsigned char *)&temp_calvals)[i] != ((unsigned char *)&calvals)[i]) {
 
-      Serial.print(F("Error writing calvals to EEPROM starting at byte "));
+      Serial.print(F("#Error writing calvals to EEPROM starting at byte "));
       Serial.println(i);
       for (int i = 0; i < sizeof(calvals) ; i++) {
         Serial.write(' ');
@@ -1528,7 +1525,7 @@ void write_calvals_to_eeprom()
   }
   EEPROM.get(sizeof(calvals), eeprom_crc_value);
   if (eeprom_crc_value != calvals_crc_value) {
-    Serial.print(F("Error reading CRC to EEPROM"));
+    Serial.print(F("#Error reading CRC to EEPROM"));
   }
 }
 
@@ -1543,40 +1540,37 @@ void print_calvals()
   }
 #endif
 
-  Serial.print(F("Build date: "));
+  Serial.print(F("#Build date: "));
   Serial.println(build_date);
 
-  Serial.print(F("Build time: "));
+  Serial.print(F("#Build time: "));
   Serial.println(build_time);
 
-  Serial.print(F("unsigned position_upper_limit: "));
+  Serial.print(F("#position_upper_limit: "));
   Serial.println(calvals.position_upper_limit);
 
-  Serial.print(F("position_lower_limit: "));
+  Serial.print(F("#position_lower_limit: "));
   Serial.println(calvals.position_lower_limit);
 
-  Serial.print(F("time_tilted_up_limit: "));
+  Serial.print(F("#time_tilted_up_limit: "));
   Serial.println(calvals.time_tilted_up_limit_in_minutes);
 
-  Serial.print(F("darkness_threshold: "));
+  Serial.print(F("#darkness_threshold: "));
   Serial.print(calvals.darkness_threshold);
 
-  Serial.print(F("supply_voltage_lower_limit: "));
+  Serial.print(F("#supply_voltage_lower_limit: "));
   Serial.println(calvals.supply_voltage_lower_limit);
 
-  Serial.print(F("supply_voltage_charge_limit_low: "));
+  Serial.print(F("#supply_voltage_charge_limit_low: "));
   Serial.println(calvals.supply_voltage_charge_limit_low);
 
-  Serial.print(F("supply_voltage_charge_limit_high: "));
+  Serial.print(F("#supply_voltage_charge_limit_high: "));
   Serial.println(calvals.supply_voltage_charge_limit_high);
 
-  Serial.print(F("supply_voltage_bms_open_threshold: "));
-  Serial.println(calvals.supply_voltage_bms_open_threshold);
-
-  Serial.print(F("accumulated_motor_on_time_limit: "));
+  Serial.print(F("#accumulated_motor_on_time_limit: "));
   Serial.println(calvals.accumulated_motor_on_time_limit);
 
-  Serial.print(F("accumulated_motor_on_time_aging_rate: "));
+  Serial.print(F("#accumulated_motor_on_time_aging_rate: "));
   Serial.println(calvals.accumulated_motor_on_time_aging_rate);
 }
 
@@ -1610,21 +1604,35 @@ void read_calvals_from_eeprom(bool fix_if_checksum_fails)
 
   bool crc_mismatch = eeprom_crc_value != stored_eeprom_crc_value;
   bool eeprom_version_out_of_date = temp_calvals.subversion < calvals.subversion;
-  if (crc_mismatch || eeprom_version_out_of_date) {
+  if (crc_mismatch || eeprom_version_out_of_date || FORCE_CALVALS_RELOAD) {
     if (crc_mismatch) {
-      Serial.println(F("CRCs don't match or "));
+      Serial.println(F("#CRCs don't match or "));
     }
     if (eeprom_version_out_of_date) {
-      Serial.println(F("EEPROM calvals out of date"));
+      Serial.println(F("#EEPROM calvals out of date"));
     }
 
     if (fix_if_checksum_fails) {
-      Serial.println(F("updating EERPOM with defaults"));
+      Serial.println(F("#updating EERPOM with defaults"));
       write_calvals_to_eeprom();
     }
   } else {
     calvals = temp_calvals;
   }
+}
+
+int dst_correction(tmElements_t *tm)
+{
+  if (tm->Month > 3 && tm->Month < 11) {
+     return 1;
+  }
+  if (tm->Month == 3 && tm->Day >= 11) {
+    return 1;
+  }
+  if (tm->Month == 11 && tm->Day < 6) {
+    return 1;
+  }
+  return 0;
 }
 
 /*
@@ -1636,24 +1644,15 @@ void setup_time(void)
   tmElements_t tm;
 
   if (RTC.read(tm)) {
-    int dst_correction = 0;
-
-    if (tm.Month > 3 && tm.Month < 11) {
-      dst_correction = 1;
-    } else if (tm.Month == 3 && tm.Day >= 11) {
-      dst_correction = 1;
-    } else if (tm.Month == 11 && tm.Day < 6) {
-      dst_correction = 1;
-    }
-    setTime(tm.Hour + dst_correction, tm.Minute, tm.Second, tm.Day, tm.Month, tm.Year);
+    setTime(tm.Hour + dst_correction(&tm), tm.Minute, tm.Second, tm.Day, tm.Month, tm.Year);
     time_of_day_valid = true;
   } else {
     if (RTC.chipPresent()) {
-      Serial.println(F("The DS1307 is stopped.  Please run the SetTime"));
-      Serial.println(F("example to initialize the time and begin running."));
+      Serial.println(F("#The DS1307 is stopped.  Please run the SetTime"));
+      Serial.println(F("#example to initialize the time and begin running."));
       Serial.println();
     } else {
-      Serial.println(F("DS1307 read error!  Please check the circuitry."));
+      Serial.println(F("#DS1307 read error!  Please check the circuitry."));
       Serial.println();
     }
   }
@@ -1685,8 +1684,8 @@ void setup()
   if (!quad_relay.begin()) {
     fail("REL");
   }
+
 #ifdef SETTIME
-  void setup_rtc();
   setup_rtc();
 #endif
 
@@ -1695,7 +1694,7 @@ void setup()
 
   enable_rs485_output();
   Serial.println("");
-  Serial.print(F("Suntracker "));
+  Serial.print(F("#Suntracker "));
   Serial.print(build_date);
   Serial.write(' ');
   Serial.println(build_time);
@@ -1711,6 +1710,7 @@ void setup()
   }
 
   disable_rs485_output();         //Turn off transmit enable
+  turn_off_power_supply();
   delay(INITIAL_DELAY);
 
   /*
@@ -1718,9 +1718,6 @@ void setup()
      s that we can set today's cron string.  We need to do that before running in time_mode.
   */
   read_time_and_sensor_inputs_callback();
-
-  setup_time();
-  set_todays_cron_string();
 }
 
 /*
@@ -1880,48 +1877,20 @@ void serialEvent()
 /*
    If SETTIME is defined, we compile-in the code below to set the device's time to the build time.
 */
+
 #ifdef SETTIME
-
-
-tmElements_t tm;
-
-void setup_rtc()
-{
-  bool parse = false;
-  bool config = false;
-
-  // get the date and time the compiler was run
-  if (getDate(build_date) && getTime(build_time)) {
-    parse = true;
-    // and configure the RTC with this info
-    if (RTC.write(tm)) {
-      config = true;
-    }
-  }
-
-  if (parse && config) {
-    Serial.print(F("DS1307 configured Time"));
-  } else if (parse) {
-    fail("DS1307");
-
-  } else {
-    fail("time string");
-  }
-}
-
-
-bool getTime(const char *str)
+bool getTime(const char *str, tmElements_t *tm)
 {
   int Hour, Min, Sec;
 
   if (sscanf(str, "%d:%d:%d", &Hour, &Min, &Sec) != 3) return false;
-  tm.Hour = Hour;
-  tm.Minute = Min;
-  tm.Second = Sec;
+  tm->Hour = Hour;
+  tm->Minute = Min;
+  tm->Second = Sec;
   return true;
 }
 
-bool getDate(const char *str)
+bool getDate(const char *str, tmElements_t *tm)
 {
   char Month[12];
   int Day, Year;
@@ -1936,9 +1905,54 @@ bool getDate(const char *str)
     if (strcmp(Month, monthName[monthIndex]) == 0) break;
   }
   if (monthIndex >= 12) return false;
-  tm.Day = Day;
-  tm.Month = monthIndex + 1;
-  tm.Year = CalendarYrToTm(Year);
+  tm->Day = Day;
+  tm->Month = monthIndex + 1;
+  tm->Year = CalendarYrToTm(Year);
   return true;
+}
+void setup_rtc()
+{
+
+  tmElements_t tm;
+
+  bool parse = false;
+  bool config = false;
+
+  // get the date and time the compiler was run
+  if (getDate(build_date, &tm) && getTime(build_time, &tm)) {
+    parse = true;
+
+    // The value we store into the RTC is the non-daylight-savings-time value
+    if (dst_correction(&tm)) {
+      if (tm.Hour == 0) {
+        fail("T");
+      }
+      tm.Hour--;   
+      tm.Second += 10; // Empirical: difference between build time and time to run this code
+      if (tm.Second > 59) {
+        tm.Minute++;
+        if (tm.Minute > 59) {
+          tm.Hour++;
+          if (tm.Hour > 23) {
+            tm.Day++;
+          }
+        }
+      }
+    }
+    // and configure the RTC with this info
+    if (RTC.write(tm)) {
+      config = true;
+    }
+  }
+
+  if (parse && config) {
+    Serial.print(F("DS1307 configured Time"));
+  } else if (parse) {
+    fail("DS1307");
+
+  } else {
+    fail("time string");
+  }
+
 }
 #endif
