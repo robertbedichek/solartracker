@@ -293,8 +293,8 @@ unsigned max_4V_current_amps = 0;  // Max recorded current since we started
 /*
    These two are from the sun angle sensor and are the raw values from the two tiny solar cells in that sensor
 */
-unsigned lower_solar_val;  // Raw ADC values 0..1023 for 0..5V
-unsigned upper_solar_val;  // Raw ADC values 0..1023 for 0..5V
+float lower_solar_volts;  
+float upper_solar_volts; 
 
 /*
    This is from the 1000mm pull-string sensor that tells us where the panels are.
@@ -347,6 +347,8 @@ unsigned backlight_timer;
    Wind speed variables
 */
 int16_t wind_speed_raw;        // Value read from ADC
+int16_t lower_solar_raw;
+int16_t upper_solar_raw;
 float wind_speed_volts;        // Wind_spee_raw converted to volts
 unsigned wind_speed_knots;      // In knots
 unsigned max_wind_speed_knots = 0;  // Maximum recorded value since we started
@@ -541,13 +543,13 @@ void vtd_display_current(void)
     case vtd_sunlow:
       lcd.print(F("Lower sun sensor"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(lower_solar_val);
+      bytes = lcd.print(lower_solar_volts);
       break;
 
     case vtd_sunhigh:
       lcd.print(F("Upper sun sensor"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(upper_solar_val);
+      bytes = lcd.print(upper_solar_volts);
       break;
 
     case vtd_voltage:
@@ -916,8 +918,10 @@ void read_time_and_sensor_inputs_callback()
       The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
       have more stable values average the last reading with this reading (and the 'last reading' is a running average)
   */
-  lower_solar_val = (ads.readADC_SingleEnded(1) + lower_solar_val) / 2;
-  upper_solar_val = (ads.readADC_SingleEnded(2) + upper_solar_val) / 2;
+  lower_solar_raw = ads.readADC_SingleEnded(1);
+  lower_solar_volts = ads.computeVolts(lower_solar_raw);
+  upper_solar_raw = ads.readADC_SingleEnded(2);
+  upper_solar_volts = ads.computeVolts(upper_solar_raw);
   position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
 
   // Read the position sensor up to ten times with .5 second break in between readings to find a value
@@ -934,9 +938,9 @@ void read_time_and_sensor_inputs_callback()
     position_sensor_failed = true;
   }
 
-  dark = (lower_solar_val + upper_solar_val) / 2 <= calvals.darkness_threshold;
-  sun_high = (dark == false) && ((lower_solar_val + 10) < upper_solar_val);
-  sun_low = dark || (lower_solar_val > (upper_solar_val + 10));
+  dark = (lower_solar_volts + upper_solar_volts) / 2 <= calvals.darkness_threshold;
+  sun_high = (dark == false) && ((lower_solar_volts + 10) < upper_solar_volts);
+  sun_low = dark || (lower_solar_volts > (upper_solar_volts + 10));
   at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
   at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;
 
@@ -1011,9 +1015,9 @@ void display_status_on_lcd_callback()
     bytes += lcd.print(c3);
 
     bytes += lcd.print(F(" "));
-    bytes += lcd.print(lower_solar_val);
+    bytes += lcd.print(lower_solar_volts);
     bytes += lcd.print(F(" "));
-    bytes += lcd.print(upper_solar_val);
+    bytes += lcd.print(upper_solar_volts);
     bytes += lcd.print(F(" "));
     bytes += lcd.print(wind_speed_knots);
 
@@ -1124,8 +1128,8 @@ void print_status_to_rs485_callback(void)
     Serial.write(' ');
     print_in_four_columns(position_difference);
 
-    print_in_four_columns(lower_solar_val);
-    print_in_four_columns(upper_solar_val);
+    print_in_four_columns((int)(lower_solar_volts/10));
+    print_in_four_columns((int)(upper_solar_volts/10));
 
     print_in_four_columns(supply_voltage / 1000);
     Serial.write('.');
@@ -1158,7 +1162,8 @@ void print_status_to_rs485_callback(void)
     print_in_four_columns(motor_overcurrent);
     print_in_four_columns(wind_speed_knots);
     Serial.println();
-
+    Serial.println(lower_solar_volts);
+    Serial.println(upper_solar_volts);
     disable_rs485_output();
   }
 }
@@ -1706,7 +1711,7 @@ void setup()
   if (!ads.begin()) {
     fail("ADS");
   } else {
-    ads.setGain(GAIN_TWO);
+    ads.setGain(GAIN_TWOTHIRDS);
   }
 
   disable_rs485_output();         //Turn off transmit enable
@@ -1815,7 +1820,7 @@ void serialEvent()
           break;
 
         case 'd':   // Set darkness threshold.  Should be done at twighlight
-          calvals.darkness_threshold = (lower_solar_val + upper_solar_val) / 2;
+          calvals.darkness_threshold = (lower_solar_volts + upper_solar_volts) / 2;
           Serial.print(F("Setting darkness threshold to: "));
           Serial.println(calvals.darkness_threshold);
           break;
