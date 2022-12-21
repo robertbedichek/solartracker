@@ -16,12 +16,6 @@
 #include <EEPROM.h>
 #include <assert.h>
 
-#ifndef RS485
-#define enable_rs485_output()
-#define disable_rs485_output()
-#define txenabled (0)
-#endif
-
 #define _TASK_SLEEP_ON_IDLE_RUN
 #include <TaskScheduler.h>
 #include <TimeLib.h>     // for update/display of time
@@ -33,45 +27,35 @@
 #include <Adafruit_RGBLCDShield.h>
 #include <utility/Adafruit_MCP23017.h>
 
-/*
-   This is for the Sparkfun 4-relay board
-*/
+
+// The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 2 is for "down".  3 and 4 are unused.
+// Relay 1, when activated, passes 12VDC when active to the go-up input of the contactor
+// that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
+// input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
+// hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
+// the panels to retain their position.  Before we had this check valve, they would gradually drift back to
+// the down position.  When we want the panels to lower, at the end of the day, we have to both release the
+// check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
+// by driving 12VDC to the "go-down" input of the contactor.
+
 #include "SparkFun_Qwiic_Relay.h"
-#define RELAY_ADDR (0x6D)
-
+#define RELAY_ADDR (0x6D)           // Default I2C address of the 4-relay board
 Qwiic_Relay quad_relay(RELAY_ADDR);
+#define RELAY_UP (1)
+#define RELAY_DOWN (2)
 
-/*
-   We needed more analog inputs than the KTA-223v3 had, so we added an ADS1015, a 4-input, 12bit
-   A/D
-*/
 #include <Adafruit_ADS1X15.h>
-//Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
-Adafruit_ADS1015 ads;     /* Use this for the 12-bit version */
+Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
 
-
-/*
-    This is for the 1307 RTC we installed on the Ocean Controls main board.
-*/
+//    This is for the 1307 RTC we installed on the Ocean Controls main board.
 #include <DS1307RTC.h>
 
-/*
- * If true, keep the power supply on all the time, regardless of temperature, voltage, etc.  Otherwise,
- * only charge below a threshold temperature and below a threshold voltage.
- */
-bool force_power_supply_on = true;
-
-/*
-   All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
-*/
+//   All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
 time_t arduino_time;
 
-/*
-   If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on
-   the time of day being valid.
-*/
+//   If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on
+//  the time of day being valid.
 bool time_of_day_valid = false;
-
 
 // The shield uses the I2C SCL and SDA pins. On classic Arduinos
 // this is Analog 4 and 5 so you can't use those for analogRead() anymore
@@ -104,97 +88,39 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 */
 #define DEFAULT_BACKLIGHT_ON_TIME (60 * 10)
 
-/*
-    This controls how much output we will emit on the RS-485 line.
-      0: only events are reported
-      1: status messages are emitted every three seconds
-      2: all messages are enabled
-*/
-#define VERBOSE_NONE   (0)
-#define VERBOSE_MEDIUM (1)
-#define VERBOSE_ALL    (2)
-
-int verbose = VERBOSE_MEDIUM;
-
-//void fail(string);
-
-/*
-   Number of milliseconds to wait after boot and build display before starting operational part.
-*/
+//   Number of milliseconds to wait after boot and build display before starting operational part.
 #define INITIAL_DELAY (2000)
 
-/*
-   Default maximum time the motor can be on continuously.  This is just the default value for when
-   the user resets to "factory defaults".  Units are milliseconds.
-*/
+//   Default maximum time the motor can be on continuously.  This is just the default value for when
+//   the user resets to "factory defaults".  Units are milliseconds.
 #define MOTOR_MAX_ON_TIME_DEFAULT (90000)
 
-/*
-   On-time hysteresis in milliseconds.  Once the motor has been running too long, past the max-motor-on-time limit,
-   we turn off until the on-time falls below the limit minus this vale.  This avoids the system turning on and off
-   rapidly when the limit is reached.
-*/
+//  On-time hysteresis in milliseconds.  Once the motor has been running too long, past the max-motor-on-time limit,
+//  we turn off until the on-time falls below the limit minus this vale.  This avoids the system turning on and off
+//  rapidly when the limit is reached.
 #define ON_TIME_HYSTERSIS (20000)
 
 
-/*
-   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, keep the battery charged, talk on the
-   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
-*/
-enum mode_e { no_panel_movement_mode, time_mode, position_mode, 
-#ifdef SOLAR_SENSOR
-  sensor_mode, 
-#endif
-  rain_stow_mode, wind_stow_mode, last_mode};
+//   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
+//   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
+enum mode_e { no_panel_movement_mode, time_mode, position_mode, rain_stow_mode, wind_stow_mode, last_mode};
 
+#define SSR_ENABLE_OUT (7) // Arduino output pin 7 on J4, writing '1' turns on 8V/100A power supply
 
-/*
-   Allocation of ATMEGA328P Analog lines -- all on "Port C"
-    PC0 (KTA-223v3 Analog 3)      - Draw-string (position) sensor
-    PC1 (KTA-223v3 opto-input A1) - Supply voltage (removed R16 pull-up resistor, wired directly to main board K2.2)
-    PC2 (KTA-223v3 opto-input A2) - Battery temperature (removed R17 pull-up resistor, wired TMP36 output directly to main board K2.3)
-    PC3 (KTA-223v3 opto-input A3) - Battery current (removed R18 pull resistor, wired Atopilot I output directly to main board K2.4)
-    PC4 (KTA-223v3 opto-input A4) - I2C SDA (data) line
-    PC5 (KTA-TXEN)                - I2C SCL (clock) line (required removing D7 to disconnect this from driving RS-485 transmit-enable)
-    PC6 (KTA-223v3 Analog 1)      - Sun sensor lower cell
-    PC7 (KTA-223v3 Analog 2)      - Sun sensor upper cell
-*/
-/*
-    The inputs and outputs are thus:
-    KTA Analog 1, which is Arduino Analog In 6, measures the voltage on the lower cell in the sun angle senseor
-    KTA Analog 2, which is Arudino Analog In 7, measures the voltage on the upper cell in the sun angle sensor
-    KTA Analog 3, which is Arudino Analog In 0, measures the voltage from the draw-string position sensor
-*/
+//    Arudino Analog In 0, measures the voltage from the draw-string position sensor
+#define DRAW_STRING_IN (0)
 
-#define ANIN1 6   // Analog 1 is connected to Arduino Analog In 6
-#define ANIN2 7   // Analog 2 is connected to Arduino Analog In 7
-#define ANIN3 0   // Analog 3 is connected to Arduino Analog In 0
+//   To monitor the supply voltage we use Arduino Analog 1. We have a resistor divider with a 68.284k Ohm resistor
+//   in series with a 32.823k Ohm resistor. The the center tap is connected to A1 (analog input 1), the other
+//   leads are connected to the supply voltage and the ground. 
+#define SUPPLY_VOLTAGE_IN (1)
 
-/*
-     These are the only analog inputs that the KTA-223 has on the outside of its shell.  However, I needed more,
-    so I have repurposed the opto-isolator inputs by removing the pull-up resistors that connect the outputs
-    of the KTA-223 opto-isolators to the Arudino inputs.  I have wired directly to the Arudino board thusly:
-
-*/
-
-/*
-    To monitor the supply voltage I used Arduino Analog 1. We have a resistor divider with a 68.284k Ohm resistor
-    in series with a 32.823k Ohm resistor. The the center tap is connected to A1 (analog input 1), the other
-   leads are connected to the supply voltage and the ground.  This input had been driven by an opto isolator with a
-   4.7 k Ohm pull up.  We removed the pull up.
-*/
-#define ANIN4 1
-
-/*
-     We needed another analog input to monitor battery temperature, so we used Arduino Analog 2.
-   It is connected to a TMP36 temperature sensor (https://learn.adafruit.com/tmp36-temperature-sensor)
-*/
-#define ANIN5 2
+//   analog input to monitor contactor temperature, so we used Arduino Analog 2.
+//   It is connected to a TMP36 temperature sensor (https://learn.adafruit.com/tmp36-temperature-sensor)
+#define TMP36_IN (2)
 
 // And for the output of a current sensor on the 4V line we use Arduino analog 3
-#define ANIN6 3
-
-
+#define CURRENT_SENSE_IN (3)
 
 void setup_time(void);
 
@@ -204,28 +130,6 @@ const char *operation_mode_string(void);
     Central (and only) task scheduler data structure.
 */
 Scheduler ts;
-
-
-/*
- * Qwiic relay board.  Relay 3 is unused.
- *
-    We use three relay outputs.  The first passes 12VDC when active to the go-up input of the contactor
-   that controls the power to the hydraulic motor.  The second passes 12VDC when active to the go-down
-   input of the contactor and to a solenoid in the check valve.  This check valve normally only allows
-   hydraulic pressure to pass to the cycliner to make it go up.  When the hydraulic motor stops, we want
-   the panels to retain their position.  Before we had this check valve, they would gradually drift back to
-    the down position.  When we want the panels to lower, at the end of the day, we have to both release the
-   check vavle by activating its solenoid and by power the hydralic motor in reverse, which is accomplished
-   by driving 12VDC to the "go-down" input of the contactor. The third relay we use is relay 4, which enables
-   120VAC or 220VAC to pass to a "wall-wart" style power supply that generates 12.3VDC @ 2A.  When our battery
-   voltage falls below 12.1VDC, we turn it on.  When it rises above 12.2VDC, we turn it off.
- */
-#define RELAY_UP (1)
-#define RELAY_DOWN (3)
-#define RELAY_UNUSED (2)
-#define RELAY_POWER_SUPPLY (4)
-
-// #define TXEN 19 // RS-485 Transmit Enable is connected to Arduino Analog 5 which is Digital 19
 
 
 /*
@@ -244,13 +148,8 @@ struct calvals_s {
   int subversion;                                  // Changing this forces an calvals EEPROM reload
   unsigned position_upper_limit;                   // Max position value (i.e., fully tilted up)
   unsigned position_lower_limit;
-  unsigned time_tilted_up_limit_in_minutes;        // In minutes, Lower the panels after this many minutes, maximum.
   float darkness_threshold;
 
-  int battery_charging_temperature_limit;          // Maximum temperature to be able to start charging
-  unsigned supply_volts_lower_limit;             // Below 7.9 volts, don't try to move panels other than lowering them.
-  unsigned supply_volts_charge_limit_low;        // Turn on charger if voltage drops below this value
-  unsigned supply_volts_charge_limit_high;       // Turn off charge when voltage goes over this value
   unsigned motor_amps_down_limit;                  // If we see a current above this many amps while lowering the panels, we will go into no-movement mode.
   unsigned motor_amps_up_limit;                    // If we see a current above this many amps while raising the panels, we will go into no-movement mode.
 
@@ -270,11 +169,6 @@ unsigned long seconds;
 unsigned long milliseconds;
 
 /*
-   It is true when we are calling for charging power, false when we are not.
-*/
-bool power_supply_on = false;
-
-/*
    These come from Arudino Analog input 1, which is driven by the center tap of two resistors that connect to the 12V line and
    ground.  We need this resistor divider network to move the 12V line to the range of the ADC, which is 0..5V.
 */
@@ -282,17 +176,13 @@ unsigned supply_tap_volts_raw;  // Raw ADC value: 0..1023 for 0..5V
 unsigned supply_tap_volts;      // Raw value converted to millivolts (of the tap)
 unsigned supply_volts;          // Tap voltage converted to supply voltage
 
-int16_t battery_1s_raw; /* = ads.readADC_SingleEnded(3); */
-float battery_1s_volts; /* = ads.computeVolts(battery_1s_raw); */
-
-
 /*
    These come from Arduino Analog input 2, which is driven by a TMP36 temperature sensor that is in the middle of the pack.
 */
-unsigned battery_temperature_volts_raw;    // raw ADC value: 0..1023 for 0..5V
-unsigned battery_temperature_millivolts;  // raw value converted to millivolts
-int battery_temperature_C_x10;            // millivolts converted to degrees Celsiuis
-int battery_temperature_F;                // Degrees C converter to Farenheight
+unsigned contactor_temperature_volts_raw;    // raw ADC value: 0..1023 for 0..5V
+unsigned contactor_temperature_millivolts;  // raw value converted to millivolts
+int contactor_temperature_C_x10;            // millivolts converted to degrees Celsiuis
+int contactor_temperature_F;                // Degrees C converter to Farenheight
 
 /*
    We have an Attopilot current sensor on the 4V line going from the Li-ion pack to the contactor.  Its voltage output
@@ -303,12 +193,7 @@ unsigned current_sense_4V_millivolts;  // Raw ADC value converted to millivolts
 unsigned current_sense_4V_amps;       // Millivolts from the Attopilot device converter to milliamps it is sensing
 unsigned max_4V_current_amps = 0;     // Max recorded current since we started
 
-/*
-   These two are from the sun angle sensor and are the raw values from the two tiny solar cells in that sensor
-*/
-//float lower_solar_volts;  
-//float upper_solar_volts; 
-
+float solar_volts;  
 float rain_sensor_volts;
 
 /*
@@ -322,20 +207,11 @@ unsigned last_position_sensor_val;    // Position value at last call to status p
 unsigned last_position_sensor_val_stall; // Position sensor value at last sample in monitor_motor_stall_callback()
 
 /*
-   Record the time today when we first raised the panels.  This is used to decide, later in the day, that it must be
-   time to lower them (in case for some reason the sun angle sensor doesn't tell us it is night time).
-*/
-unsigned long time_of_first_raise = 0ULL;
-
-/*
-   These are calculated from the values read from sun angle sensor.  'sun_high' means the sun is in a position that puts
-   its rays at an angle lower than 90 degrees and naturally happens as the earth rotates during the day.  To remedy this,
-   we move the panels up.  'sun_low' means the opposite and naturally happens when we rotate the panels past the point
-   where the sun is at a 90 degree angle to the panels.  That's our trigger to stop moving the panels.  'dark' is when
+    'dark' is when
    both sensors indicate the light level is so low that it must be nighttime.  That is our trigger to lower the panels to
    their nighttime, resting position.
 */
-bool sun_high, sun_low, dark;
+bool dark;
 
 /*
    Calculated from 'position_sensor_val' and the position limit calibration values.
@@ -371,15 +247,11 @@ unsigned max_wind_speed_knots = 0; // Maximum recorded value since we started
 
 int16_t rain_sensor_raw;
 
-#ifdef SOLAR_SENSOR
-int16_t lower_solar_raw;
-int16_t upper_solar_raw;
-#endif
+int16_t solar_raw;
 
 // Forward definitions of the call-back functions that we pass to the task scheduler.
 
 void read_time_and_sensor_inputs_callback();
-void print_status_to_rs485_callback();
 
 
 /*
@@ -388,10 +260,10 @@ void print_status_to_rs485_callback();
 void display_status_on_lcd_callback();
 void monitor_buttons_callback();
 void monitor_lcd_backlight_callback();
+void print_status_to_serial_callback();
 void monitor_cron_callback();
 void monitor_upward_moving_panels_and_stop_when_time_elapsed_callback();
 void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback();
-void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback();
 void monitor_rain_sensor_callback();
 void monitor_wind_sensor_callback();
 
@@ -402,18 +274,13 @@ Task monitor_cron(TASK_SECOND * 3600 * 4, TASK_FOREVER, &monitor_cron_callback, 
 Task monitor_upward_moving_panels_and_stop_when_time_elapsed(TASK_SECOND, TASK_FOREVER, &monitor_upward_moving_panels_and_stop_when_time_elapsed_callback, &ts, false);
 Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND/10, TASK_FOREVER, 
                                               &monitor_upward_moving_panels_and_stop_when_target_position_reached_callback, &ts, false);
-Task monitor_upward_moving_panels_and_stop_when_sun_angle_correct(300, TASK_FOREVER, &monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback, &ts, false);
 Task monitor_rain_sensor(TASK_SECOND * 30, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
 Task monitor_wind_sensor(TASK_SECOND * 10, TASK_FOREVER, &monitor_wind_sensor_callback, &ts, true);
 
-
-void control_battery_charger_callback();
 void control_hydraulics_callback();
 void monitor_position_limits_callback();
 void monitor_motor_on_time_callback();
-void monitor_rs485_input_callback();
 void monitor_motor_stall_callback();
-
 
 /*
    These are the tasks that are the heart of the logic that controls this system.  Some run periodically and are always enabled.  Some run only
@@ -421,14 +288,12 @@ void monitor_motor_stall_callback();
 */
 
 Task read_time_and_sensor_inputs(200, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
-Task print_status_to_rs485(TASK_SECOND * 10, TASK_FOREVER, &print_status_to_rs485_callback, &ts, true);
-Task control_battery_charger(TASK_SECOND * 10, TASK_FOREVER, &control_battery_charger_callback, &ts, true);
+Task print_status_to_serial(TASK_SECOND * 10, TASK_FOREVER, &print_status_to_serial_callback, &ts, true);
 Task control_hydraulics(TASK_SECOND * 60, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
 
 Task monitor_position_limits(50, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
 Task monitor_motor_on_time(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_callback, &ts, true);
 Task monitor_motor_stall(500, TASK_FOREVER, &monitor_motor_stall_callback, &ts, false);
-Task monitor_rs485_input(100, TASK_FOREVER, &monitor_rs485_input_callback, &ts, true);
 
 
 /*
@@ -444,13 +309,7 @@ void set_calvals_to_defaults()
 {
   calvals.position_upper_limit = 350;                          // Max position value (i.e., fully tilted up)
   calvals.position_lower_limit = 60;
-  calvals.time_tilted_up_limit_in_minutes = 10 * 60; // Lower the panels after 10 hours, maximum.
   calvals.darkness_threshold = .1;
-
-  calvals.battery_charging_temperature_limit = 90;        // Do not start charging when battery temperature above 85F
-  calvals.supply_volts_lower_limit = 7900;              // Below 7.9 volts, don't try to move panels other than lowering them.
-  calvals.supply_volts_charge_limit_low = 8100;         // Turn on charger if voltage drops below this value
-  calvals.supply_volts_charge_limit_high = 8285;        // Turn off charge when voltage goes over this value
   calvals.motor_amps_down_limit = 30;                     // If we see a current this high, we'll go into no-movement mode
   calvals.motor_amps_up_limit = 70;                       // If we see a current this high, we'll go into no-movement mode
   calvals.wind_speed_limit = 15;                          // Above this wind speed, in knots, we will lower the panels
@@ -491,7 +350,6 @@ const char *const cron_table[] PROGMEM = {
 char todays_cron_string[MAX_CRON_STRING];
 char *current_cron_p = NULL;
 
-
 /*
    When this is non-zero, do not let the normal update happen to the LCD so that the value the user
    wanted to see stays on the display for some number of seconds (like 10).
@@ -517,11 +375,8 @@ void monitor_lcd_backlight_callback(void)
 }
 
 enum val_to_display_e { vtd_none = 0, vtd_max_4V_current, vtd_temperature, vtd_volts, vtd_build_date, vtd_build_time, vtd_time, vtd_mode, vtd_position, 
-#ifdef SOLAR_SENSOR
-vtd_sunlow, vtd_sunhigh,
-#endif
-                        vtd_motor_on_time, vtd_max_knots, vtd_position_upper_limit,
-                        vtd_position_lower_limit, vtd_time_tilted_up_limit_in_minutes, vtd_darkness_threshold, vtd_battery_charging_temperature_limit, vtd_motor_amps_limit,
+                       vtd_sun, vtd_motor_on_time, vtd_max_knots, vtd_position_upper_limit,
+                        vtd_position_lower_limit, vtd_time_tilted_up_limit_in_minutes, vtd_darkness_threshold, vtd_motor_amps_limit,
                         vtd_wind_speed_limit, vtd_accumulated_motor_on_time_limit, vtd_accumulated_motor_on_time_aging_rate, vtd_backlight_on_time, vtd_last
                       } vtd_current = vtd_none;
 
@@ -577,20 +432,12 @@ void vtd_display_current(void)
       bytes = lcd.print(position_sensor_val);
       break;
 
-#ifdef SOLAR_SENSOR
-    case vtd_sunlow:
-      lcd.print(F("Lower sun sensor"));
+    case vtd_sun:
+      lcd.print(F("sun sensor"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(lower_solar_volts);
+      bytes = lcd.print(solar_volts);
       break;
-
-    case vtd_sunhigh:
-      lcd.print(F("Upper sun sensor"));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(upper_solar_volts);
-      break;
-#endif
-
+      
     case vtd_volts:
       lcd.print(F("Supply Voltage  "));
       lcd.setCursor(0, 1);
@@ -598,13 +445,12 @@ void vtd_display_current(void)
       bytes += lcd.print(F("."));
       bytes += lcd.print(supply_volts % 1000);
       bytes += lcd.print(F(" "));
-      bytes += lcd.print(battery_1s_volts);
       break;
 
     case vtd_temperature:
-      lcd.print(F("Battery Temperat"));
+      lcd.print(F("Relay Temperat"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(battery_temperature_F) + 1;
+      bytes = lcd.print(contactor_temperature_F) + 1;
       lcd.write('F');
       break;
 
@@ -638,23 +484,10 @@ void vtd_display_current(void)
       bytes = lcd.print(calvals.position_lower_limit);
       break;
 
-    case vtd_time_tilted_up_limit_in_minutes:
-      lcd.print(F("Time tilted up limit"));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(calvals.time_tilted_up_limit_in_minutes);
-      lcd.print(F(" min"));
-      break;
-
     case vtd_darkness_threshold:
       lcd.print(F("Darkness thresh"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(calvals.darkness_threshold);
-      break;
-
-    case vtd_battery_charging_temperature_limit:
-      lcd.print(F("Charging temp limit"));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(calvals.battery_charging_temperature_limit);
       break;
 
     case vtd_motor_amps_limit:
@@ -733,16 +566,8 @@ void monitor_buttons_callback()
           calvals.position_lower_limit += delta;
           break;
 
-        case vtd_time_tilted_up_limit_in_minutes:
-          calvals.time_tilted_up_limit_in_minutes += delta;
-          break;
-
         case vtd_darkness_threshold:
           calvals.darkness_threshold += delta;
-          break;
-
-        case vtd_battery_charging_temperature_limit:
-          calvals.battery_charging_temperature_limit += delta;
           break;
 
         case vtd_motor_amps_limit:
@@ -763,6 +588,10 @@ void monitor_buttons_callback()
 
         case vtd_backlight_on_time:
           calvals.backlight_on_time += delta;
+          break;
+
+        default:
+          Serial.println(F("# VTD"));
           break;
 
       }
@@ -798,6 +627,11 @@ void stop_driving_panels(const char *who_called)
 {
   Serial.print(F("# stop_driving_panels(), called by "));
   Serial.println(who_called);
+
+  // Turn off 8V supply and wait 100 milliseconds
+  digitalWrite(SSR_ENABLE_OUT, LOW);
+  delay(100);
+  // Now turn off the relays, less wear on them to not be switching power
   quad_relay.turnRelayOff(RELAY_UP);
   quad_relay.turnRelayOff(RELAY_DOWN);
   panels_going_down = false;
@@ -808,7 +642,6 @@ void stop_driving_panels(const char *who_called)
    */
   monitor_position_limits.disable();
   monitor_motor_stall.disable();
-  monitor_upward_moving_panels_and_stop_when_sun_angle_correct.disable();
   monitor_upward_moving_panels_and_stop_when_time_elapsed.disable();
   monitor_upward_moving_panels_and_stop_when_target_position_reached.disable();
 
@@ -825,7 +658,6 @@ void stop_driving_panels(const char *who_called)
 void fail(const char *fail_message)
 {
   stop_driving_panels("fail");
-  enable_rs485_output();
   Serial.print(F("#todays_cron_string:"));
   Serial.println(todays_cron_string);
   Serial.print(F("#current_cron_p: "));
@@ -839,39 +671,7 @@ void fail(const char *fail_message)
   abort();
 }
 
-#ifdef RS485
-/*
-   Set when we have enabled the Arduino serial output (from its UART) to drive the RS-485 line.  Most of the time, this is not
-   set.  This allows us to listen for characters from the other side.  We only set this when we need to send characters.
-*/
-bool txenabled;
 
-/*
-   Our RS-485 output is only active when we are transmitting.  Otherwise, we have this half-duplex channel
-   in a listening mode so that we can receive commands.  See
-*/
-void enable_rs485_output()
-{
-  if (UCSR0A | (1 << TXC0)) {
-    //  fail("enable485");
-  }
-  digitalWrite(TXEN, HIGH);   //Enable Transmit
-  delay(1);                   //Let 485 chip go into Transmit Mode
-  txenabled = true;
-}
-
-/*
-   Disable the connection from the output of our UART to the RS-485 lines.  See
-   https://exploreembedded.com/wiki/UART_Programming_with_Atmega128
-   For more information on the UART programming.
-*/
-void disable_rs485_output()
-{
-  while (!(UCSR0A & (1 << TXC0)));      // Wait for the transmit buffer to be empty
-  digitalWrite(TXEN, LOW);              //Turn off transmit enable
-  txenabled = false;
-}
-#endif
 
 /*
    Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
@@ -883,7 +683,11 @@ void drive_panels_up(void)
     fail("drive_panels_up()");
   } else {
     Serial.println(F("# lift "));
+    // Turn on "up" relay, wait 100 milliseconds, then turn on 8V supply, less wear on relay
     quad_relay.turnRelayOn(RELAY_UP);
+    delay(100);
+    digitalWrite(SSR_ENABLE_OUT, HIGH);
+  
     lcd.setCursor(0, 1);
     lcd.print(F("Going up "));
     vtd_timeout = 10;
@@ -907,38 +711,18 @@ void drive_panels_down(void)
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
+
+    // Turn on "down" relay, wait 100 milliseconds, then turn on SSR to power 8V supply, less wear on mechanical relay
     quad_relay.turnRelayOn(RELAY_DOWN);
+    delay(100);
+    digitalWrite(SSR_ENABLE_OUT, HIGH);
+    
     panels_going_down = true;
     stall_count = 0;
     monitor_position_limits.enable();
     monitor_motor_stall.enable();
   }
 }
-
-
-/*
-   Turn on the AC input of the power supply, so that we may charge our lithium battery pack.
-*/
-void turn_on_power_supply(void)
-{
-  if (power_supply_on == false) {
-    quad_relay.turnRelayOn(RELAY_POWER_SUPPLY);
-    power_supply_on = true;
-  }
-}
-
-/*
-   Turn off the AC input of the power supply.  We do this when the battery voltage is high enough
-   that we do not need to charge further.
-*/
-void turn_off_power_supply(void)
-{
-  if (power_supply_on) {
-    quad_relay.turnRelayOff(RELAY_POWER_SUPPLY);
-    power_supply_on = false;
-  }
-}
-
 
 /*
    This reads all the sensors frequently, does a little filtering of some of them, and deposits the results in global variables above.
@@ -947,7 +731,7 @@ void read_time_and_sensor_inputs_callback()
 {
   arduino_time = now();
 
-  supply_tap_volts_raw = analogRead(ANIN4);
+  supply_tap_volts_raw = analogRead(/* Arduino analog input 1 */ SUPPLY_VOLTAGE_IN);
 
   /*
      The value by which we multiple the raw value, and the value we add or subtract after that are determined
@@ -955,107 +739,23 @@ void read_time_and_sensor_inputs_callback()
      with 5.5 digit multimeter (Rigol DM3058).
   */
   supply_tap_volts = (((unsigned long)supply_tap_volts_raw * 5036UL) / 1023UL) + 2;
-  supply_volts = (supply_tap_volts * 10000UL) / 3245UL;
+  supply_volts = (supply_tap_volts * 10000UL) / 3061UL;
 
-  battery_temperature_volts_raw = analogRead(ANIN5);
-  battery_temperature_millivolts = (((unsigned long)battery_temperature_volts_raw * 5000UL) / 1023) + 20 /* Calibration value */;
-  battery_temperature_C_x10 = battery_temperature_millivolts - 500;
-  battery_temperature_F = ((((long)battery_temperature_C_x10 * 90L) / 50L) + 320L) / 10L;
+  contactor_temperature_volts_raw = analogRead(/* Arduino analong input */ TMP36_IN);
+  contactor_temperature_millivolts = (((unsigned long)contactor_temperature_volts_raw * 5000UL) / 1023) + 20 /* Calibration value */;
+  contactor_temperature_C_x10 = contactor_temperature_millivolts - 500;
+  contactor_temperature_F = ((((long)contactor_temperature_C_x10 * 90L) / 50L) + 320L) / 10L;
 
-  current_sense_4V_volts_raw = analogRead(ANIN6);
+  current_sense_4V_volts_raw = analogRead(/* Arduino analog input 3 */ CURRENT_SENSE_IN);
   current_sense_4V_millivolts = ((unsigned long)current_sense_4V_volts_raw * 5000UL) / 1023UL;
   current_sense_4V_amps = ((unsigned long)current_sense_4V_millivolts * 1000UL) / 36600UL;
   if (max_4V_current_amps < current_sense_4V_amps) {
     max_4V_current_amps = current_sense_4V_amps;
   }
 
-#ifdef SOLAR_SENSOR
-  /*
-      The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
-      have more stable values average the last reading with this reading (and the 'last reading' is a running average)
-  */
-  lower_solar_raw = ads.readADC_SingleEnded(2);
-  lower_solar_volts = ads.computeVolts(lower_solar_raw);
-  upper_solar_raw = ads.readADC_SingleEnded(1);
-  upper_solar_volts = ads.computeVolts(upper_solar_raw);
-#endif
 
-  rain_sensor_raw = ads.readADC_SingleEnded(1);
-  rain_sensor_volts = ads.computeVolts(rain_sensor_raw);
-    
-  battery_1s_raw = ads.readADC_SingleEnded(3);
-  battery_1s_volts = ads.computeVolts(battery_1s_raw);
-
-  position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
-
-  // Read the position sensor up to ten times with .5 second break in between readings to find a value
-  // That is is in range.  Normally the first reading is in range and there is no .5 delay.  If after
-  // ten tries, none are in range, set 'position_sensor_failed' to true
-  bool previous_position_sensor_failed = position_sensor_failed;
-  for (int i = 0 ; i < 10 ; i++) {
-    position_sensor_val = (analogRead(ANIN3) + position_sensor_val) / 2;
-    if (position_sensor_val >= 20 && position_sensor_val <= 500) {
-      if (previous_position_sensor_failed) {
-        Serial.print(F("Position sensor started working again"));
-        position_sensor_failed = false;
-      } 
-      break;
-    } else {
-      delay(500);
-    }
-    position_sensor_failed = true;
-  }
-  if (previous_position_sensor_failed == false && position_sensor_failed) {
-    Serial.print(F("Position sensor failed"));
-    if (calvals.operation_mode == position_mode) {
-      calvals.operation_mode = time_mode;
-    }
-  }
-
-#ifdef SOLAR_SENSOR
-  dark = (lower_solar_volts + upper_solar_volts) / 2.0 <= calvals.darkness_threshold;
-  sun_high = (dark == false) && ((lower_solar_volts + 1.0) < upper_solar_volts);
-  sun_low = dark || (lower_solar_volts > (upper_solar_volts + 1.0));
-#endif
-
-  at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
-  at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;
-
-/*
- * If the panels at either position limit and not moving, only send output once every ten minutes.
- * If the panels are not at either limit and not in moving, send output every ten seconds
- * If the panels are moving, send output every 200 milliseconds
- */
-  long current_interval_in_milliseconds = print_status_to_rs485.getInterval();
-  const long ten_minutes_in_milliseconds = 10 * 60 * TASK_SECOND;
-  if (panels_going_up || panels_going_down) {
-    const long two_hundred_milliseconds = 200;
-    if (current_interval_in_milliseconds != two_hundred_milliseconds) {
-      Serial.print(F("# print-status interval set to 200ms, was="));
-      Serial.println(current_interval_in_milliseconds);
-      print_status_to_rs485.setInterval(two_hundred_milliseconds);
-    }
-    // Do not go into "slow print mode" until at least 30 seconds after start up.
-  } else if (millis() > 30000 && (at_upper_position_limit || at_lower_position_limit)) {
-    if (current_interval_in_milliseconds != ten_minutes_in_milliseconds) {
-      Serial.print(F("# print-status interval set to ten minutes, pos="));
-      Serial.print(position_sensor_val);
-      Serial.print(F(" interval was="));
-      Serial.println(current_interval_in_milliseconds);
-      print_status_to_rs485.setInterval(ten_minutes_in_milliseconds);
-    }
-  } else {
-    long ten_seconds_in_milliseconds = 10 * TASK_SECOND; // default case, panels not moving and not at either limit
-    if (current_interval_in_milliseconds != ten_seconds_in_milliseconds) {
-      Serial.print(F("# print-status interval set to ten seconds, was="));
-      Serial.println(current_interval_in_milliseconds);
-      print_status_to_rs485.setInterval(ten_seconds_in_milliseconds);
-    }
-  }
-
-  /*
-     Empirical correction from measurement at zero windspeed, means 'wind_speed_volts is zero at zero windspeed.
-  */
+  // Empirical correction from measurement at zero windspeed, means 'wind_speed_volts is zero at zero windspeed.
+ 
   wind_speed_raw = ads.readADC_SingleEnded(0);
   wind_speed_volts = ads.computeVolts(wind_speed_raw);
 
@@ -1072,6 +772,85 @@ void read_time_and_sensor_inputs_callback()
       max_wind_speed_knots = wind_speed_knots;
     }
   }
+  
+  rain_sensor_raw = ads.readADC_SingleEnded(/* ADS1115 input */1);
+  rain_sensor_volts = ads.computeVolts(rain_sensor_raw);
+
+// Input 2 (the four inputs are numbered 0, 1, 2, 3) is unused 
+//  _sensor_raw = ads.readADC_SingleEnded(/* ADS1115 input */2);
+//  _sensor_volts = ads.computeVolts(_sensor_raw);
+
+  /*
+      The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
+      have more stable values average the last reading with this reading (and the 'last reading' is a running average)
+  */
+  solar_raw = ads.readADC_SingleEnded(/* ADS1115 input */3);
+  solar_volts = ads.computeVolts(solar_raw);
+  
+  position_sensor_val = (analogRead(DRAW_STRING_IN) + position_sensor_val) / 2;
+
+  // Read the position sensor up to ten times with .5 second break in between readings to find a value
+  // That is is in range.  Normally the first reading is in range and there is no .5 delay.  If after
+  // ten tries, none are in range, set 'position_sensor_failed' to true
+  bool previous_position_sensor_failed = position_sensor_failed;
+  for (int i = 0 ; i < 10 ; i++) {
+    position_sensor_val = (analogRead(/* Arduino analog input */ DRAW_STRING_IN) + position_sensor_val) / 2;
+    if (position_sensor_val >= 20 && position_sensor_val <= 500) {
+      if (previous_position_sensor_failed) {
+        Serial.println(F("#Position sensor working"));
+        position_sensor_failed = false;
+      } 
+      break;
+    } else {
+      delay(500);
+    }
+    position_sensor_failed = true;
+  }
+  if (previous_position_sensor_failed == false && position_sensor_failed) {
+    Serial.println(F("#Position sensor failed"));
+    if (calvals.operation_mode == position_mode) {
+      calvals.operation_mode = time_mode;
+    }
+  }
+
+  dark = solar_volts <= calvals.darkness_threshold;
+  
+  at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
+  at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;
+
+/*
+ * If the panels at either position limit and not moving, only send output once every ten minutes.
+ * If the panels are not at either limit and not in moving, send output every ten seconds
+ * If the panels are moving, send output every 200 milliseconds
+ */
+  long current_interval_in_milliseconds = print_status_to_serial.getInterval();
+  const long ten_minutes_in_milliseconds = 10 * 60 * TASK_SECOND;
+  if (panels_going_up || panels_going_down) {
+    const long two_hundred_milliseconds = 200;
+    if (current_interval_in_milliseconds != two_hundred_milliseconds) {
+      Serial.print(F("# print-status interval set to 200ms, was="));
+      Serial.println(current_interval_in_milliseconds);
+      print_status_to_serial.setInterval(two_hundred_milliseconds);
+    }
+    // Do not go into "slow print mode" until at least 30 seconds after start up.
+  } else if (millis() > 30000 && (at_upper_position_limit || at_lower_position_limit)) {
+    if (current_interval_in_milliseconds != ten_minutes_in_milliseconds) {
+      Serial.print(F("# print-status interval set to ten minutes, pos="));
+      Serial.print(position_sensor_val);
+      Serial.print(F(" interval was="));
+      Serial.println(current_interval_in_milliseconds);
+      print_status_to_serial.setInterval(ten_minutes_in_milliseconds);
+    }
+  } else {
+    long ten_seconds_in_milliseconds = 10 * TASK_SECOND; // default case, panels not moving and not at either limit
+    if (current_interval_in_milliseconds != ten_seconds_in_milliseconds) {
+      Serial.print(F("# print-status interval set to ten seconds, was="));
+      Serial.println(current_interval_in_milliseconds);
+      print_status_to_serial.setInterval(ten_seconds_in_milliseconds);
+    }
+  }
+
+  
 }
 
 void print2digits(int number)
@@ -1118,18 +897,13 @@ void display_status_on_lcd_callback()
     bytes += lcd.print(c2);
 
     char c3 = ' ';
-    if (power_supply_on) {
-      c3 = 'P';
-    }
+   
     bytes += lcd.print(c3);
 
     bytes += lcd.print(F(" "));
-#ifdef SOLAR_SENSOR
-    bytes += lcd.print((int)(lower_solar_volts * 10.0));
+    bytes += lcd.print((int)(solar_volts * 10.0));
     bytes += lcd.print(F(" "));
-    bytes += lcd.print((int)(upper_solar_volts * 10.0));
-    bytes += lcd.print(F(" "));
-#endif
+   
     bytes += lcd.print((int)(rain_sensor_volts * 10.0));
     bytes += lcd.print(F(" "));
     
@@ -1214,21 +988,17 @@ plot 'tracker.data' using 1:(($5 * 100.0))      t "Mode" with lines lc rgb "blac
 
 */
 
-void print_status_to_rs485_callback(void)
+void print_status_to_serial_callback(void)
 {
   static char line_counter = 0;
 
-  if (verbose > VERBOSE_NONE) {
     position_difference = (int)last_position_sensor_val - (int)position_sensor_val;
     last_position_sensor_val = position_sensor_val;
 
-    enable_rs485_output();
     if (line_counter == 0) {
-#ifdef SOLAR_SENSOR
-      Serial.println(F("# Date Time   Year Mode Pos Diff Lwr Uppr Volts  1s-Volts Temp Amps MotT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS"));
-#else
-      Serial.println(F("# Date Time   Year Mode Pos Diff Rain     Volts  1s-Volts Temp Amps MotT Drk SnH SnL UpL LwL GUp GDn PoS CoL OvC KTS"));
-#endif
+
+      Serial.println(F("# Date Time   Year Mode Pos Diff  Sol Rain  Volts  Temp Amps MotT Drk UpL LwL GUp GDn CoL OvC KTS"));
+
       line_counter = 20;
     } else {
       line_counter--;
@@ -1252,77 +1022,31 @@ void print_status_to_rs485_callback(void)
     print_in_four_columns(position_sensor_val);
     Serial.write(' ');
     print_in_four_columns(position_difference);
-
-#ifdef SOLAR_SENSOR
-    print_in_four_columns((int)(lower_solar_volts * 100.0));
-    print_in_four_columns((int)(upper_solar_volts * 100.0));
-#else
+    Serial.write(' ');
+    print_in_four_columns((int)(solar_volts * 100.0));
+    Serial.write(' ');
     print_in_four_columns((int)(rain_sensor_volts * 100.0));
-    Serial.print("  - ");  // Needed for Gnuplot to get the associations of column with data values correct
-#endif
 
     print_in_four_columns(supply_volts / 1000);
     Serial.write('.');
     print_in_three_columns_with_leading_zeroes(supply_volts % 1000);
-    Serial.write(' ');
-    print_in_four_columns((int)(battery_1s_volts));
-    Serial.write('.');
-    print_in_three_columns_with_leading_zeroes((int)(battery_1s_volts * 1000.0) % 1000);
-    Serial.write(' ');
-
-    print_in_four_columns(battery_temperature_F);
+    Serial.write(' ');  
+    print_in_four_columns(contactor_temperature_F);
     Serial.write(' ');
     
-#ifdef BATTERY_TEMPERATURE_VERBOSE
-    Serial.print(F("bat temp raw="));
-    Serial.print(battery_temperature_volts_raw);
-    Serial.print(F(" bat milli="));
-    Serial.print(battery_temperature_millivolts);    // raw value converted to millivolts
-    Serial.print(F(" C="));
-    Serial.print(battery_temperature_C_x10);
-#endif
-
-
     print_in_four_columns(current_sense_4V_amps);
     print_in_four_columns(accumulated_motor_on_time / 1000);
     print_in_four_columns(dark);
-    print_in_four_columns(sun_high);
-    print_in_four_columns(sun_low);
     print_in_four_columns(at_upper_position_limit);  
     print_in_four_columns(at_lower_position_limit);
     print_in_four_columns(panels_going_up);
     print_in_four_columns(panels_going_down);
-    print_in_four_columns(power_supply_on);
     print_in_four_columns(motor_cooling_off);
     print_in_four_columns(motor_overcurrent);
     print_in_four_columns(wind_speed_knots);
     Serial.println();
-    disable_rs485_output();
-  }
 }
 
-/*
-  Check to see if the battery charger needs to be turned on or off.
-*/
-void control_battery_charger_callback()
-{
-  // If we are in a less sophisticated mode, signaled by 'force_power_supply_on' being true, then charge between midnight and 1AM.
-  if (force_power_supply_on) {
-    if (hour(arduino_time) == 0) {
-      turn_on_power_supply();
-    } else {
-      turn_off_power_supply();
-    }
-  } else {
-    if (supply_volts < calvals.supply_volts_charge_limit_low && battery_temperature_F <= calvals.battery_charging_temperature_limit) {
-      turn_on_power_supply();
-    } else if (supply_volts > calvals.supply_volts_charge_limit_high || 
-        battery_temperature_F > calvals.battery_charging_temperature_limit || 
-        battery_1s_volts > 4.1) {
-      turn_off_power_supply();
-    }
-  }
-}
 
 #define POSITION_HYSTERSIS (1)
 
@@ -1497,20 +1221,6 @@ void monitor_motor_on_time_callback()
 }
 
 /*
-   This is called back periodically when the panels are moving up.  Stop their upwards movement if the sun angle sensor
-   tell us that the sun is now normal to the plane of the panels.  If that is the case, disable this task.
-*/
-void monitor_upward_moving_panels_and_stop_when_sun_angle_correct_callback()
-{
-  if (panels_going_up == false) {
-    fail("MA");
-  }
-  if (sun_low == true) {
-    stop_driving_panels("sun angle");
-  }
-}
-
-/*
    Number of seconds we are driving the panels up, only used in time_mode.
 */
 char seconds_left_driving_panel_up;
@@ -1559,9 +1269,8 @@ int target_position_by_hour[MAX_TARGET_POSITION] = {150 /* 11AM */, 250 /* noon*
 
 void control_hydraulics_callback()
 {
-  bool supply_volts_ok = supply_volts > calvals.supply_volts_lower_limit;
 
-  if (panels_going_up || panels_going_down || !supply_volts_ok || motor_cooling_off || position_sensor_failed || millis() < 10000) {
+  if (panels_going_up || panels_going_down || motor_cooling_off || position_sensor_failed || millis() < 10000) {
     return;
   }
 
@@ -1636,11 +1345,10 @@ void control_hydraulics_callback()
                   fail("missing D");
                 }
                 current_cron_p = p;
-                if (verbose > VERBOSE_NONE) {
-                  Serial.print(F("#Executing Up command for "));
-                  Serial.print((unsigned)seconds_left_driving_panel_up);
-                  Serial.println(F(" seconds"));
-                }
+                Serial.print(F("#Executing Up command for "));
+                Serial.print((unsigned)seconds_left_driving_panel_up);
+                Serial.println(F(" seconds"));
+               
                 break;
   
               case 'D':
@@ -1648,9 +1356,9 @@ void control_hydraulics_callback()
                 if (*(p + 1) != '\0') {
                   fail("garbage");
                 }
-                if (verbose > VERBOSE_NONE) {
-                  Serial.print(F("# Executing D command"));
-                }
+                
+                Serial.print(F("# Executing D command"));
+   
                 if (!at_lower_position_limit) {
                   drive_panels_down();
                 }
@@ -1673,7 +1381,7 @@ void control_hydraulics_callback()
       break;
 
 //  #define MAX_TARGET_POSITION (6)
-// int target_position_by_hour[MAX_TARGET_POSITION] = {150 /* 11AM */, 200 /* noon*/, 300 /* 1PM */, 350 /* 2PM */, 400 /* 3PM */, 450 /* 4PM */};
+// int target_position_by_hour[MAX_TARGET_POSITION] = {150 /* 10AM */, 200 /* 11AM*/, 300 /* noon */, 350 /* 1PM */, 400 /* 2PM */, 460 /* 3PM */};
 
     case position_mode:
       if (time_of_day_valid) {
@@ -1682,8 +1390,8 @@ void control_hydraulics_callback()
         }
         // Between 11AM and 4PM, raise the panels
         int h = hour(arduino_time);
-        if (11 <= h && h <= 16) {    
-          int position_index = h - 11; /* We don't move the panels until 11 AM */
+        if (10 <= h && h <= 15) {    
+          int position_index = h - 10; /* We don't move the panels until 10 AM */
           if (position_index >= 0 && position_index < MAX_TARGET_POSITION) {
             desired_position = target_position_by_hour[position_index];
             if (desired_position > calvals.position_upper_limit) {
@@ -1698,7 +1406,33 @@ void control_hydraulics_callback()
           // In May, June, July, and August, lower the panels at 8PM.
           // Other months, lower them at 7PM
           int m = month(arduino_time);
-          int hour_to_go_down = (m < 5 || m > 9) ? 19 : 20;
+          int hour_to_go_down = 20;
+          switch (m) {
+            case 1:
+            case 12: 
+              hour_to_go_down = 18;
+              break;
+            
+            case 2:
+            case 3:
+            case 4:
+            case 9:
+            case 10:
+            case 11: 
+              hour_to_go_down = 19;
+              break;
+              
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+              hour_to_go_down = 20;
+              break;
+
+            default:
+              fail("p");
+            
+          }
           if (h >= hour_to_go_down) {
             if (!at_lower_position_limit) {
               drive_panels_down();
@@ -1707,28 +1441,6 @@ void control_hydraulics_callback()
         }
       }
       break;
-
-#ifdef SOLAR_SENSOR
-    case sensor_mode:
-      {
-        // If we need to raise the panel and the panel is not at is position limit, turn on the relay to raise it.
-        if (sun_high && at_upper_position_limit == false) {
-          if (time_of_first_raise == 0ULL) {
-            time_of_first_raise = time_now;
-          }
-          drive_panels_up();
-          monitor_upward_moving_panels_and_stop_when_sun_angle_correct.enable();
-        }
-        unsigned time_since_first_raise_in_minutes = ((time_now - time_of_first_raise) / 1000) / 60;
-        bool bedtime = (time_since_first_raise_in_minutes > calvals.time_tilted_up_limit_in_minutes) || dark;
-        if (panels_going_up == false && panels_going_down == false && bedtime) {
-          if (at_lower_position_limit == false) {
-            drive_panels_down();
-          }
-        }
-      }
-      break;
-#endif
 
     case rain_stow_mode:
     case wind_stow_mode:
@@ -1838,50 +1550,6 @@ void write_calvals_to_eeprom()
   }
 }
 
-/*
-   Print the calibration values to RS-485 output.  This assumes that the RS-485 transmitter is already enabled.
-*/
-void print_calvals()
-{
-#ifdef RS485
-  if (txenabled == false) {
-    fail("print_calvals");
-  }
-#endif
-
-  Serial.print(F("#Build date: "));
-  Serial.println(build_date);
-
-  Serial.print(F("#Build time: "));
-  Serial.println(build_time);
-
-  Serial.print(F("#position_upper_limit: "));
-  Serial.println(calvals.position_upper_limit);
-
-  Serial.print(F("#position_lower_limit: "));
-  Serial.println(calvals.position_lower_limit);
-
-  Serial.print(F("#time_tilted_up_limit: "));
-  Serial.println(calvals.time_tilted_up_limit_in_minutes);
-
-  Serial.print(F("#darkness_threshold: "));
-  Serial.print(calvals.darkness_threshold);
-
-  Serial.print(F("#supply_volts_lower_limit: "));
-  Serial.println(calvals.supply_volts_lower_limit);
-
-  Serial.print(F("#supply_volts_charge_limit_low: "));
-  Serial.println(calvals.supply_volts_charge_limit_low);
-
-  Serial.print(F("#supply_volts_charge_limit_high: "));
-  Serial.println(calvals.supply_volts_charge_limit_high);
-
-  Serial.print(F("#accumulated_motor_on_time_limit: "));
-  Serial.println(calvals.accumulated_motor_on_time_limit);
-
-  Serial.print(F("#accumulated_motor_on_time_aging_rate: "));
-  Serial.println(calvals.accumulated_motor_on_time_aging_rate);
-}
 
 /*
    Read the calibration values from the EEPROM.  If their checksum fails, then do not update the calibration values
@@ -1974,17 +1642,13 @@ void setup_time(void)
 void setup()
 {
   analogReference(DEFAULT);
-
-  //pinMode(REL1, OUTPUT);  // declare the relay pin as an output
-  //pinMode(REL2, OUTPUT);  // declare the relay pin as an output
-  //pinMode(REL8, OUTPUT);  // declare the relay pin as an output
-
-  //pinMode(TXEN, OUTPUT);
+  pinMode(SSR_ENABLE_OUT, OUTPUT);
 
   // Set the working calibration values to the defaults that are in this file
   set_calvals_to_defaults();
 
   Wire.begin();
+
   lcd.begin(16, 2);
   lcd.print(F("Suntracker 1.0"));
   lcd.setCursor(0, 1);
@@ -1993,7 +1657,9 @@ void setup()
   if (!quad_relay.begin()) {
     fail("REL");
   }
+  quad_relay.turnAllRelaysOff();
 
+ 
 #ifdef SETTIME
   setup_rtc();
 #endif
@@ -2001,13 +1667,47 @@ void setup()
   Serial.begin(SERIAL_BAUD);
   UCSR0A = UCSR0A | (1 << TXC0); //Clear Transmit Complete Flag
 
-  enable_rs485_output();
   Serial.println("");
   Serial.print(F("#Suntracker "));
   Serial.print(build_date);
   Serial.write(' ');
   Serial.println(build_time);
-
+// #define RELAY_TEST // For bench testing only
+#ifdef RELAY_TEST
+  digitalWrite(SSR_ENABLE_OUT, HIGH); 
+  delay(1000);
+  for (int relay = 1 ; relay <= 4 ; relay++) {
+    
+    if (quad_relay.getState(relay) != 0) {
+      lcd.setCursor(0, 1);
+      lcd.print(F("relay mismatch (not 0)"));
+      Serial.println("relay mismatch (not 0)");
+    }
+    Serial.println(F("turning on relay"));
+    quad_relay.turnRelayOn(relay);
+    if (quad_relay.getState(relay) != 1) {
+      lcd.setCursor(0, 1);
+      lcd.print(F("relay mismatch (not 1)"));
+      Serial.println("relay mismatch (not 1)");
+    }
+    delay(10000);
+    if (quad_relay.getState(relay) != 1) {
+      lcd.setCursor(0, 1);
+      lcd.print(F("relay mismatch (not 1)"));
+      Serial.println("relay mismatch (not 1)");
+    }
+    Serial.println(F("turning off relay"));
+    quad_relay.turnRelayOff(relay);
+    if (quad_relay.getState(relay) != 0) {
+      lcd.setCursor(0, 1);
+      lcd.print(F("relay mismatch (not 0)"));
+      Serial.println("relay mismatch (not 0)");
+    }
+    delay(1000);
+  }
+  digitalWrite(SSR_ENABLE_OUT, LOW);
+  
+#endif
   // Try reading calibration values from EEPROM.  If that fails, write our default calibration values to EERPOM
   read_calvals_from_eeprom(true);
   backlight_timer = calvals.backlight_on_time;
@@ -2017,11 +1717,6 @@ void setup()
   } else {
     ads.setGain(GAIN_TWOTHIRDS);
   }
-
-  disable_rs485_output();         //Turn off transmit enable
-  turn_off_power_supply();
-  delay(INITIAL_DELAY);
-
 
   /*
      Set a valid initial value for lots of globals.  We need this in order to get the tm structure set,
@@ -2064,12 +1759,6 @@ const char *operation_mode_string(void)
       return ("time");
       break;
 
-#ifdef SOLAR_SENSOR
-    case sensor_mode:
-      return ("sensor");
-      break;
-#endif
-
     case position_mode:
       return("position");
       break;
@@ -2090,122 +1779,7 @@ const char *operation_mode_string(void)
 
 const char *operation_mode_string(void);
 
-void serialEvent()
-{
-  if (Serial.available() == 0) {
-    fail("serialEvent()");
-  }
-
-  // This may fail, but I haven't see it fail yet.  I think it is just a matter of time, but in the meantime, I want
-  // to ensure that the issues I am seeing are not due to entering this function with txenabled.
-#ifdef RS485
-  if (txenabled == true) {
-    fail("txenabled");
-  }
-#endif
-  char c = Serial.read();      // Get the waiting character
-  if (c == 0) {
-    return;
-  }
-
-  switch (c) {
-    case 'v':
-      enable_rs485_output();
-      verbose = (verbose + 1) % (VERBOSE_ALL + 1); // Cycle between 0, 1, 2
-      Serial.print(F("Verbosity level now: "));
-      Serial.println(verbose);
-      break;
-
-    case '*':
-      while (Serial.available() == 0);
-      c = Serial.read();
-      enable_rs485_output();
-      Serial.println("");
-      switch (c) {
-        case 'f':
-          set_calvals_to_defaults();
-          Serial.println(F("restored factory defaults to working calibration values"));
-          Serial.println(F("use the s command to save them to EEPROM"));
-          break;
-
-        case 'u':  // Set upper position limit to current position
-          calvals.position_upper_limit = position_sensor_val;
-          Serial.print(F("Setting upper position limit to "));
-          Serial.println(calvals.position_upper_limit);
-          break;
-
-        case 'l':  // Set lower position limit to current position
-          calvals.position_lower_limit = position_sensor_val;
-          Serial.print(F("Setting lower position limit to "));
-          Serial.println(calvals.position_lower_limit);
-          break;
-
-#ifdef SOLAR_SENSOR
-        case 'd':   // Set darkness threshold.  Should be done at twighlight
-          calvals.darkness_threshold = (lower_solar_volts + upper_solar_volts) / 2;
-          Serial.print(F("Setting darkness threshold to: "));
-          Serial.println(calvals.darkness_threshold);
-          break;
-#endif
-
-        case 'h':
-          Serial.println(F("*f - set factory defaults"));
-          Serial.println(F("*u - set upper position limit to current position"));
-          Serial.println(F("*l - set lower position limit to current position"));
-          Serial.println(F("*d - set darkness threshold to current light level"));
-          Serial.println(F("*h - print this help message"));
-          Serial.println(F("*p - display the values of the calibration values"));
-          Serial.println(F("*r - restore the calibration values from the EEPROM"));
-          Serial.println(F("*s - save calibration values to EEPROM"));
-          Serial.println(F("*t - toggle operational mode"));
-          break;
-
-        case 'p': // Print the calvals
-          print_calvals();
-          break;
-
-        case 'r': // Restore calibration values from EEPROM
-          read_calvals_from_eeprom(false);
-          break;
-
-        case 's': // Save calibration values to EEPROM
-          Serial.println(F("Saving calibration values to EEPROM"));
-          write_calvals_to_eeprom();
-          break;
-
-        case 't': // Toggle operational mode on and off
-          {
-            enum mode_e new_operation_mode = (enum mode_e)(((int)calvals.operation_mode + 1) % last_mode);
-            if (new_operation_mode == time_mode && time_of_day_valid == false) {
-              Serial.println(F("Cannot enter time mode when RTC inop"));
-            } else {
-              calvals.operation_mode = new_operation_mode;
-            }
-            Serial.print(F("Operational mode "));
-            Serial.print(operation_mode_string());
-            Serial.println("");
-          }
-          break;
-
-        default:
-          Serial.println(F("Unrecognized command character (expected 'u', 'l', 'd', or 'h'): "));
-          break;
-      }
-      break;
-
-    default:
-      enable_rs485_output();
-      Serial.print(F("Unrecog: "));
-      Serial.println(c, HEX);
-      break;
-  }
-  disable_rs485_output();         //Turn off transmit enable
-}
-
-/*
-   If SETTIME is defined, we compile-in the code below to set the device's time to the build time.
-*/
-
+//   If SETTIME is defined, we compile-in the code below to set the device's time to the build time.
 #ifdef SETTIME
 bool getTime(const char *str, tmElements_t *tm)
 {
