@@ -108,6 +108,7 @@ unsigned low_current_count = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 95;
+bool panels_retracted;
 
 //   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
 //   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
@@ -156,7 +157,7 @@ struct calvals_s {
 } calvals;
 
 const int motor_amps_down_limit = 30;
-const int motor_amps_up_limit = 90;
+const int motor_amps_up_limit = 99;
 
 const int wind_speed_limit = 5;
 const int high_wind_threshold = 10;
@@ -635,6 +636,7 @@ void drive_panels_up(void)
     panels_going_up = true;
     stall_start_time = 0;
     under_current_start_time = 0;
+    panels_retracted;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -644,14 +646,15 @@ void drive_panels_up(void)
    Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going up when this was called.
 */
-void drive_panels_down(void) 
+void drive_panels_down(const __FlashStringHelper *why) 
 {
-  if (at_lower_position_limit) {
+  if (at_lower_position_limit || panels_retracted) {
     return;
   } else if (panels_going_up) {
     fail(F("drive_panels_down"));
   } else {
-    Serial.println(F("# retract"));
+    Serial.print(F("# retract: "));
+    Serial.println(why);
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
@@ -661,6 +664,7 @@ void drive_panels_down(void)
     panels_going_down = true;
     stall_start_time = 0;
     under_current_start_time = 0;
+    panels_retracted = true;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -1047,8 +1051,10 @@ bool is_raining(void)
 
 void turn_off_rain_sensor(void)
 {
-  quad_relay.turnRelayOff(RELAY_RAIN_SENSOR);
-  Serial.println(F("# rain sensor off"));
+  if (quad_relay.getState(RELAY_RAIN_SENSOR)) {
+     quad_relay.turnRelayOff(RELAY_RAIN_SENSOR);
+    Serial.println(F("# rain sensor off"));
+  }
 }
 
 /*
@@ -1080,7 +1086,7 @@ void monitor_rain_sensor_callback()
     Serial.println(F("# rain stow"));
     calvals.operation_mode = rain_stow_mode;
     if (!at_lower_position_limit) {
-      drive_panels_down();
+      drive_panels_down(F("rain-stow"));
     }
     monitor_rain_sensor.setInterval(60 * 60 * 1000); // 60 minute so that we don't turn the rain sensor on too often
 
@@ -1146,7 +1152,7 @@ void monitor_wind_sensor_callback()
           Serial.println(F("# wind stow"));
           calvals.operation_mode = wind_stow_mode;
           if (!at_lower_position_limit) {
-            drive_panels_down();
+            drive_panels_down(F("wind-stow"));
           }
         }
       }
@@ -1329,7 +1335,7 @@ void drive_panels_to_desired_position(void)
   } else if (lower_hour <= h && dark) {
     turn_off_rain_sensor();  // With panels all the way down, no need to monitor for rain
     monitor_rain_sensor.disable();
-    drive_panels_down();
+    drive_panels_down(F("stowing for night"));
   }
   // At midnight, reset the number of daily stalls
   if (h == 0 && daily_stalls > 0) {
