@@ -30,7 +30,7 @@
 #include <Adafruit_RGBLCDShield.h>
 
 // This string variable is used by multiple functions below, but not at the same time
-char cbuf[40];
+char cbuf[55];
 
 
 // The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 3 is for "down".
@@ -156,7 +156,7 @@ struct calvals_s {
   enum mode_e operation_mode;  // Mode to start in
 } calvals;
 
-const int motor_amps_down_limit = 30;
+const int motor_amps_down_limit = 40;
 const int motor_amps_up_limit = 99;
 
 const int wind_speed_limit = 5;
@@ -636,7 +636,7 @@ void drive_panels_up(void)
     panels_going_up = true;
     stall_start_time = 0;
     under_current_start_time = 0;
-    panels_retracted;
+    panels_retracted = false;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -757,7 +757,7 @@ void read_time_and_sensor_inputs_callback()
   }
 
   supply_volts_temp /= samples;
-  supply_volts = alpha * supply_volts_temp + (1 - alpha) * supply_volts;
+  supply_volts = supply_volts_temp;  // Don't do EMA on this, we want to see spikes
 
   contactor_temperature_F_temp /= samples;
   contactor_temperature_F = alpha * contactor_temperature_F_temp + (1 - alpha) * contactor_temperature_F;
@@ -879,7 +879,7 @@ void print_status_to_serial_callback(void)
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
      abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
-     skipped_record_counter++ > 600) {
+     skipped_record_counter++ > 1200) {
 
     last_position_sensor_val = position_sensor_val;
     last_operation_mode = calvals.operation_mode;
@@ -987,10 +987,12 @@ void monitor_stall_and_motor_current_callback()
       if (stall_start_time == 0) {
         stall_start_time = now;
       } else if ((now - stall_start_time) > 500) {
-        stop_driving_panels(F("motor stall going up"));
+        stop_driving_panels(F("motor stall going down"));
         daily_stalls++;
-        calvals.position_lower_limit = position_sensor_val + 5;
-        Serial.println(F("# alert increasing lower limit due to stall"));
+        if (daily_stalls > 5) {
+          calvals.position_lower_limit += 5;
+          Serial.println(F("# alert increasing lower limit due to stall going down more than 5 times"));
+        }
       }
     } else {
       stall_start_time = 0; // Panels are moving down, reset the time of last stall start
@@ -1000,16 +1002,24 @@ void monitor_stall_and_motor_current_callback()
   }
   // Now check to see if the hydraulic motor is taking too little or too much current
   int amps = motor_amps();
+  char vbuf[10];
+  dtostrf(supply_volts, 6, 3, vbuf);
 
-  Serial.print(F("# motor current: "));
-  Serial.println(amps);
+  snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
+             hour(arduino_time),
+             minute(arduino_time),
+             second(arduino_time),
+             (unsigned)position_sensor_val,
+             amps,
+            vbuf);
+  
+  Serial.println(cbuf);
   if (amps < motor_current_threshold_low) {
     unsigned long now = millis();
     if (under_current_start_time == 0) {
       under_current_start_time = now;
-    } else if ((now - under_current_start_time) > 3000) {
-      stop_driving_panels(F("low current for 3 seconds"));
-      calvals.operation_mode = no_panel_movement_mode;
+    } else if ((now - under_current_start_time) > 9000) {
+      stop_driving_panels(F("low current for 9 seconds"));
     }
   } else {
     under_current_start_time = 0; // Not taking too little, reset the start time of undercurrent
@@ -1019,7 +1029,7 @@ void monitor_stall_and_motor_current_callback()
       stop_driving_panels(F("# alert high current"));
     }
   }
-    last_position_sensor_val_stall = position_sensor_val;
+  last_position_sensor_val_stall = position_sensor_val;
 }
 
 const float rain_threshold = 3.0;  // Below this voltage, we say it is raining
@@ -1131,11 +1141,11 @@ void monitor_wind_sensor_callback()
   static unsigned wind_stow_mode_delay;
   static unsigned high_wind_count;
 
-  if (wind_speed_knots < 1.0) {  // If the wind is calm, start counting down
+  if (wind_speed_knots < 2.0) {  // If the wind is calm, start counting down
     high_wind_count = 0;
     if (calvals.operation_mode == wind_stow_mode) {
       wind_stow_mode_delay++;
-      if (wind_stow_mode_delay > 3600 * 2 * 2) {  // Wait two hours
+      if (wind_stow_mode_delay > 3600 * 2 / 5) {  // Wait two hours
         calvals.operation_mode = position_mode;
       }
     }
