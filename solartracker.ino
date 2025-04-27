@@ -976,8 +976,10 @@ void monitor_stall_and_motor_current_callback()
       } else if ((now - stall_start_time) > 500) {
         stop_driving_panels(F("motor stall going up"));
         daily_stalls++;
-        calvals.position_upper_limit = position_sensor_val - 5;
-        Serial.println(F("# alert decreasing upper limit"));
+        if (daily_stalls > 2) {
+          calvals.position_upper_limit -= 5;
+          Serial.println(F("# alert decreasing upper limit due to stall going up"));
+        }
       }
     } else {
       stall_start_time = 0; // Panels are moving up, reset the time of last stall start
@@ -989,9 +991,9 @@ void monitor_stall_and_motor_current_callback()
       } else if ((now - stall_start_time) > 500) {
         stop_driving_panels(F("motor stall going down"));
         daily_stalls++;
-        if (daily_stalls > 5) {
+        if (daily_stalls > 2) {
           calvals.position_lower_limit += 5;
-          Serial.println(F("# alert increasing lower limit due to stall going down more than 5 times"));
+          Serial.println(F("# alert increasing lower limit due to stall going down more than 2 times"));
         }
       }
     } else {
@@ -1054,7 +1056,7 @@ bool is_raining(void)
   for (int i = 0 ; i < samples ; i++) {
    rain_sensor_raw += ads.readADC_SingleEnded(/* ADS1115 input */ 1);
   }
-  float rain_sensor_volts = ads.computeVolts(rain_sensor_raw / samples);
+  rain_sensor_volts = ads.computeVolts(rain_sensor_raw / samples);
 
   return rain_sensor_volts < rain_threshold;
 }
@@ -1093,12 +1095,12 @@ void monitor_rain_sensor_callback()
       is_raining()) {
 
     turn_off_rain_sensor(); // Now that we know it is raining, preserve the contacts by depowering it for an hour
-    Serial.println(F("# rain stow"));
+    Serial.println(F("# alert rain stow"));
     calvals.operation_mode = rain_stow_mode;
     if (!at_lower_position_limit) {
       drive_panels_down(F("rain-stow"));
     }
-    monitor_rain_sensor.setInterval(60 * 60 * 1000); // 60 minute so that we don't turn the rain sensor on too often
+    monitor_rain_sensor.setInterval(60UL * 60UL * 1000UL); // 60 minutes so that we don't turn the rain sensor on too often
 
     // The sensor is now dry, if we are in rain-stow mode, then start incrementing a counter
     // If that counter gets to some value, which indicates the sensor has been dry for a while, then
@@ -1116,6 +1118,7 @@ void monitor_rain_sensor_callback()
         rain_stopped_time = current_second;
       } else {
         if ((current_second - rain_stopped_time) > 7200) {
+          Serial.println(F("# alert leaving rain-stow mode, resuming normal operation"));
           // The rain stopped two hours ago, leave rain-stow mode.
           calvals.operation_mode = position_mode;
           rain_stopped_time = 0;
@@ -1429,8 +1432,6 @@ void set_arduino_time_from_rtc(void)
              tm.Hour,
              tm.Minute,
              tm.Second);
-    Serial.print("# alert set_arduino_time_from_rtc(): ");
-    Serial.println(cbuf);
 
     setTime(tm.Hour + dst_correction(&tm), tm.Minute, tm.Second, tm.Day, tm.Month, tmYearToCalendar(tm.Year));
     time_of_day_valid = true;
@@ -1577,7 +1578,6 @@ void set_rtc_from_build_date_and_time()
   bool parse = false;
   bool config = false;
 
-  Serial.println(F("# alert set_rtc_from_build_date_and_time()"));
   // get the date and time the compiler was run
   if (getDate(__DATE__, &tm) && getTime(__TIME__, &tm)) {
     parse = true;
@@ -1611,8 +1611,7 @@ void set_rtc_from_build_date_and_time()
              tm.Hour,
              tm.Minute,
              tm.Second);
-    Serial.print("# alert set_rtc .. ");
-    Serial.println(cbuf);
+
 
     if (RTC.write(tm)) {
       if (RTC.read(tm)) {
@@ -1623,15 +1622,13 @@ void set_rtc_from_build_date_and_time()
                  tm.Hour,
                  tm.Minute,
                  tm.Second);
-        Serial.print("# alert read-back: ");
-        Serial.println(cbuf);
         config = true;
       }
     }
   }
 
   if (parse && config) {
-    Serial.println(F("# alert DS1307 configured Time"));
+      // Normal path
   } else if (parse) {
     fail(F("# alert DS1307"));
 
