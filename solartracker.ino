@@ -1112,17 +1112,17 @@ void monitor_rain_sensor_callback()
     if (raining) {
       rain_stopped_time = 0;     // It is still raining, keep this set to zero.
     } else {
-      unsigned current_second = millis() / 1000;
+      unsigned long current_second = millis() / 1000UL;
       
       if (rain_stopped_time == 0) {
         rain_stopped_time = current_second;
       } else {
-        if ((current_second - rain_stopped_time) > 7200) {
+        if ((current_second - rain_stopped_time) > 7200UL) {
           Serial.println(F("# alert leaving rain-stow mode, resuming normal operation"));
           // The rain stopped two hours ago, leave rain-stow mode.
           calvals.operation_mode = position_mode;
           rain_stopped_time = 0;
-          monitor_rain_sensor.setInterval(30 * 1000); // Back to normal checking for rain every 30 seconds
+          monitor_rain_sensor.setInterval(30 * 1000UL); // Back to normal checking for rain every 30 seconds
           if (!panel_movement_time) {
             monitor_rain_sensor.disable();
           }
