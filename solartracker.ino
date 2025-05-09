@@ -159,8 +159,8 @@ struct calvals_s {
 const int motor_amps_down_limit = 40;
 const int motor_amps_up_limit = 99;
 
-const int wind_speed_limit = 5;
-const int high_wind_threshold = 10;
+const float low_wind_threshold = 6;
+const float high_wind_threshold = 12;
 
 #define BACKLIGHT_ON_TIME (3600)
 #define INITIAL_OPERATION_MODE (mode_position)
@@ -457,7 +457,7 @@ void vtd_display_current(void) {
     case vtd_wind_speed_limit:
       lcd.print(F("Wind speed limit"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(wind_speed_limit);
+    //  bytes = lcd.print(wind_speed_limit);
       break;
 
     case vtd_accumulated_motor_on_time_limit:
@@ -1069,6 +1069,9 @@ void turn_off_rain_sensor(void)
   }
 }
 
+int panel_movement_start_hour(void);
+int panel_movement_end_hour(void);
+
 /*
  * This is called periodically and is never disabled.  It measures the voltage on the output
  * of an op-amp whose input is connected to a circuit board that is exposed to the sky.  The circuit board
@@ -1144,16 +1147,17 @@ void monitor_wind_sensor_callback()
   static unsigned wind_stow_mode_delay;
   static unsigned high_wind_count;
 
-  if (wind_speed_knots < 2.0) {  // If the wind is calm, start counting down
+  if (wind_speed_knots < low_wind_threshold) {  // If the wind is calm, start counting down
     high_wind_count = 0;
     if (calvals.operation_mode == wind_stow_mode) {
       wind_stow_mode_delay++;
       if (wind_stow_mode_delay > 3600 * 2 / 5) {  // Wait two hours
+        Serial.println(F("# alert leaving wind-stow mode"));
         calvals.operation_mode = position_mode;
       }
     }
-  } else if (wind_speed_knots >= wind_speed_limit) {
-    if (high_wind_count < high_wind_threshold) {
+  } else if (wind_speed_knots >= high_wind_threshold) {
+    if (high_wind_count < 7) { // Must see this high wind this many times before we go into wind-stow mode
       high_wind_count++;
     } else {
       if (!panels_going_up && !panels_going_down) {  // Avoid panel movement when the panels are in motion
@@ -1162,7 +1166,8 @@ void monitor_wind_sensor_callback()
             calvals.operation_mode != rain_stow_mode && 
             calvals.operation_mode != wind_stow_mode) {
 
-          Serial.println(F("# wind stow"));
+          Serial.print(F("# alert wind-stow knots="));
+          Serial.print((int)wind_speed_knots);
           calvals.operation_mode = wind_stow_mode;
           if (!at_lower_position_limit) {
             drive_panels_down(F("wind-stow"));
