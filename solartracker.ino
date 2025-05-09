@@ -30,7 +30,7 @@
 #include <Adafruit_RGBLCDShield.h>
 
 // This string variable is used by multiple functions below, but not at the same time
-char cbuf[40];
+char cbuf[55];
 
 
 // The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 3 is for "down".
@@ -108,6 +108,7 @@ unsigned low_current_count = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 95;
+bool panels_retracted;
 
 //   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
 //   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
@@ -155,11 +156,11 @@ struct calvals_s {
   enum mode_e operation_mode;  // Mode to start in
 } calvals;
 
-const int motor_amps_down_limit = 30;
-const int motor_amps_up_limit = 90;
+const int motor_amps_down_limit = 40;
+const int motor_amps_up_limit = 99;
 
-const int wind_speed_limit = 5;
-const int high_wind_threshold = 10;
+const float low_wind_threshold = 6;
+const float high_wind_threshold = 12;
 
 #define BACKLIGHT_ON_TIME (3600)
 #define INITIAL_OPERATION_MODE (mode_position)
@@ -456,7 +457,7 @@ void vtd_display_current(void) {
     case vtd_wind_speed_limit:
       lcd.print(F("Wind speed limit"));
       lcd.setCursor(0, 1);
-      bytes = lcd.print(wind_speed_limit);
+    //  bytes = lcd.print(wind_speed_limit);
       break;
 
     case vtd_accumulated_motor_on_time_limit:
@@ -635,6 +636,7 @@ void drive_panels_up(void)
     panels_going_up = true;
     stall_start_time = 0;
     under_current_start_time = 0;
+    panels_retracted = false;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -644,14 +646,15 @@ void drive_panels_up(void)
    Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going up when this was called.
 */
-void drive_panels_down(void) 
+void drive_panels_down(const __FlashStringHelper *why) 
 {
-  if (at_lower_position_limit) {
+  if (at_lower_position_limit || panels_retracted) {
     return;
   } else if (panels_going_up) {
     fail(F("drive_panels_down"));
   } else {
-    Serial.println(F("# retract"));
+    Serial.print(F("# retract: "));
+    Serial.println(why);
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
@@ -661,6 +664,7 @@ void drive_panels_down(void)
     panels_going_down = true;
     stall_start_time = 0;
     under_current_start_time = 0;
+    panels_retracted = true;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -753,7 +757,7 @@ void read_time_and_sensor_inputs_callback()
   }
 
   supply_volts_temp /= samples;
-  supply_volts = alpha * supply_volts_temp + (1 - alpha) * supply_volts;
+  supply_volts = supply_volts_temp;  // Don't do EMA on this, we want to see spikes
 
   contactor_temperature_F_temp /= samples;
   contactor_temperature_F = alpha * contactor_temperature_F_temp + (1 - alpha) * contactor_temperature_F;
@@ -875,7 +879,7 @@ void print_status_to_serial_callback(void)
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
      abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
-     skipped_record_counter++ > 600) {
+     skipped_record_counter++ > 1200) {
 
     last_position_sensor_val = position_sensor_val;
     last_operation_mode = calvals.operation_mode;
@@ -972,8 +976,10 @@ void monitor_stall_and_motor_current_callback()
       } else if ((now - stall_start_time) > 500) {
         stop_driving_panels(F("motor stall going up"));
         daily_stalls++;
-        calvals.position_upper_limit = position_sensor_val - 5;
-        Serial.println(F("# alert decreasing upper limit"));
+        if (daily_stalls > 2) {
+          calvals.position_upper_limit -= 5;
+          Serial.println(F("# alert decreasing upper limit due to stall going up"));
+        }
       }
     } else {
       stall_start_time = 0; // Panels are moving up, reset the time of last stall start
@@ -983,10 +989,12 @@ void monitor_stall_and_motor_current_callback()
       if (stall_start_time == 0) {
         stall_start_time = now;
       } else if ((now - stall_start_time) > 500) {
-        stop_driving_panels(F("motor stall going up"));
+        stop_driving_panels(F("motor stall going down"));
         daily_stalls++;
-        calvals.position_lower_limit = position_sensor_val + 5;
-        Serial.println(F("# alert increasing lower limit due to stall"));
+        if (daily_stalls > 2) {
+          calvals.position_lower_limit += 5;
+          Serial.println(F("# alert increasing lower limit due to stall going down more than 2 times"));
+        }
       }
     } else {
       stall_start_time = 0; // Panels are moving down, reset the time of last stall start
@@ -996,16 +1004,24 @@ void monitor_stall_and_motor_current_callback()
   }
   // Now check to see if the hydraulic motor is taking too little or too much current
   int amps = motor_amps();
+  char vbuf[10];
+  dtostrf(supply_volts, 6, 3, vbuf);
 
-  Serial.print(F("# motor current: "));
-  Serial.println(amps);
+  snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
+             hour(arduino_time),
+             minute(arduino_time),
+             second(arduino_time),
+             (unsigned)position_sensor_val,
+             amps,
+            vbuf);
+  
+  Serial.println(cbuf);
   if (amps < motor_current_threshold_low) {
     unsigned long now = millis();
     if (under_current_start_time == 0) {
       under_current_start_time = now;
-    } else if ((now - under_current_start_time) > 3000) {
-      stop_driving_panels(F("low current for 3 seconds"));
-      calvals.operation_mode = no_panel_movement_mode;
+    } else if ((now - under_current_start_time) > 9000) {
+      stop_driving_panels(F("low current for 9 seconds"));
     }
   } else {
     under_current_start_time = 0; // Not taking too little, reset the start time of undercurrent
@@ -1015,7 +1031,7 @@ void monitor_stall_and_motor_current_callback()
       stop_driving_panels(F("# alert high current"));
     }
   }
-    last_position_sensor_val_stall = position_sensor_val;
+  last_position_sensor_val_stall = position_sensor_val;
 }
 
 const float rain_threshold = 3.0;  // Below this voltage, we say it is raining
@@ -1040,16 +1056,21 @@ bool is_raining(void)
   for (int i = 0 ; i < samples ; i++) {
    rain_sensor_raw += ads.readADC_SingleEnded(/* ADS1115 input */ 1);
   }
-  float rain_sensor_volts = ads.computeVolts(rain_sensor_raw / samples);
+  rain_sensor_volts = ads.computeVolts(rain_sensor_raw / samples);
 
   return rain_sensor_volts < rain_threshold;
 }
 
 void turn_off_rain_sensor(void)
 {
-  quad_relay.turnRelayOff(RELAY_RAIN_SENSOR);
-  Serial.println(F("# rain sensor off"));
+  if (quad_relay.getState(RELAY_RAIN_SENSOR)) {
+     quad_relay.turnRelayOff(RELAY_RAIN_SENSOR);
+    Serial.println(F("# rain sensor off"));
+  }
 }
+
+int panel_movement_start_hour(void);
+int panel_movement_end_hour(void);
 
 /*
  * This is called periodically and is never disabled.  It measures the voltage on the output
@@ -1077,12 +1098,12 @@ void monitor_rain_sensor_callback()
       is_raining()) {
 
     turn_off_rain_sensor(); // Now that we know it is raining, preserve the contacts by depowering it for an hour
-    Serial.println(F("# rain stow"));
+    Serial.println(F("# alert rain stow"));
     calvals.operation_mode = rain_stow_mode;
     if (!at_lower_position_limit) {
-      drive_panels_down();
+      drive_panels_down(F("rain-stow"));
     }
-    monitor_rain_sensor.setInterval(60 * 60 * 1000); // 60 minute so that we don't turn the rain sensor on too often
+    monitor_rain_sensor.setInterval(60UL * 60UL * 1000UL); // 60 minutes so that we don't turn the rain sensor on too often
 
     // The sensor is now dry, if we are in rain-stow mode, then start incrementing a counter
     // If that counter gets to some value, which indicates the sensor has been dry for a while, then
@@ -1094,16 +1115,17 @@ void monitor_rain_sensor_callback()
     if (raining) {
       rain_stopped_time = 0;     // It is still raining, keep this set to zero.
     } else {
-      unsigned current_second = millis() / 1000;
+      unsigned long current_second = millis() / 1000UL;
       
       if (rain_stopped_time == 0) {
         rain_stopped_time = current_second;
       } else {
-        if ((current_second - rain_stopped_time) > 7200) {
+        if ((current_second - rain_stopped_time) > 7200UL) {
+          Serial.println(F("# alert leaving rain-stow mode, resuming normal operation"));
           // The rain stopped two hours ago, leave rain-stow mode.
           calvals.operation_mode = position_mode;
           rain_stopped_time = 0;
-          monitor_rain_sensor.setInterval(30 * 1000); // Back to normal checking for rain every 30 seconds
+          monitor_rain_sensor.setInterval(30 * 1000UL); // Back to normal checking for rain every 30 seconds
           if (!panel_movement_time) {
             monitor_rain_sensor.disable();
           }
@@ -1125,16 +1147,17 @@ void monitor_wind_sensor_callback()
   static unsigned wind_stow_mode_delay;
   static unsigned high_wind_count;
 
-  if (wind_speed_knots < 1.0) {  // If the wind is calm, start counting down
+  if (wind_speed_knots < low_wind_threshold) {  // If the wind is calm, start counting down
     high_wind_count = 0;
     if (calvals.operation_mode == wind_stow_mode) {
       wind_stow_mode_delay++;
-      if (wind_stow_mode_delay > 3600 * 2 * 2) {  // Wait two hours
+      if (wind_stow_mode_delay > 3600 * 2 / 5) {  // Wait two hours
+        Serial.println(F("# alert leaving wind-stow mode"));
         calvals.operation_mode = position_mode;
       }
     }
-  } else if (wind_speed_knots >= wind_speed_limit) {
-    if (high_wind_count < high_wind_threshold) {
+  } else if (wind_speed_knots >= high_wind_threshold) {
+    if (high_wind_count < 7) { // Must see this high wind this many times before we go into wind-stow mode
       high_wind_count++;
     } else {
       if (!panels_going_up && !panels_going_down) {  // Avoid panel movement when the panels are in motion
@@ -1143,10 +1166,11 @@ void monitor_wind_sensor_callback()
             calvals.operation_mode != rain_stow_mode && 
             calvals.operation_mode != wind_stow_mode) {
 
-          Serial.println(F("# wind stow"));
+          Serial.print(F("# alert wind-stow knots="));
+          Serial.print((int)wind_speed_knots);
           calvals.operation_mode = wind_stow_mode;
           if (!at_lower_position_limit) {
-            drive_panels_down();
+            drive_panels_down(F("wind-stow"));
           }
         }
       }
@@ -1329,7 +1353,7 @@ void drive_panels_to_desired_position(void)
   } else if (lower_hour <= h && dark) {
     turn_off_rain_sensor();  // With panels all the way down, no need to monitor for rain
     monitor_rain_sensor.disable();
-    drive_panels_down();
+    drive_panels_down(F("stowing for night"));
   }
   // At midnight, reset the number of daily stalls
   if (h == 0 && daily_stalls > 0) {
@@ -1413,8 +1437,6 @@ void set_arduino_time_from_rtc(void)
              tm.Hour,
              tm.Minute,
              tm.Second);
-    Serial.print("# alert set_arduino_time_from_rtc(): ");
-    Serial.println(cbuf);
 
     setTime(tm.Hour + dst_correction(&tm), tm.Minute, tm.Second, tm.Day, tm.Month, tmYearToCalendar(tm.Year));
     time_of_day_valid = true;
@@ -1561,7 +1583,6 @@ void set_rtc_from_build_date_and_time()
   bool parse = false;
   bool config = false;
 
-  Serial.println(F("# alert set_rtc_from_build_date_and_time()"));
   // get the date and time the compiler was run
   if (getDate(__DATE__, &tm) && getTime(__TIME__, &tm)) {
     parse = true;
@@ -1595,8 +1616,7 @@ void set_rtc_from_build_date_and_time()
              tm.Hour,
              tm.Minute,
              tm.Second);
-    Serial.print("# alert set_rtc .. ");
-    Serial.println(cbuf);
+
 
     if (RTC.write(tm)) {
       if (RTC.read(tm)) {
@@ -1607,15 +1627,13 @@ void set_rtc_from_build_date_and_time()
                  tm.Hour,
                  tm.Minute,
                  tm.Second);
-        Serial.print("# alert read-back: ");
-        Serial.println(cbuf);
         config = true;
       }
     }
   }
 
   if (parse && config) {
-    Serial.println(F("# alert DS1307 configured Time"));
+      // Normal path
   } else if (parse) {
     fail(F("# alert DS1307"));
 
