@@ -32,6 +32,10 @@
 // This string variable is used by multiple functions below, but not at the same time
 char cbuf[55];
 
+const bool let_panels_fall_without_power_global = true;
+const unsigned long max_solenoid_on_time_in_seconds = 1800;
+unsigned long solenoid_power_supply_on_time_in_seconds;
+
 
 // The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 3 is for "down".
 // 2 is unused.  Relay 4 controls the connection to the rain sensor.  We leave it off most of the time, especially
@@ -118,7 +122,9 @@ enum mode_e { no_panel_movement_mode,
               wind_stow_mode,
               last_mode };
 
-#define SSR_ENABLE_OUT (7)  // Arduino output pin 7 on J4, writing '1' turns on 9V/100A power supply
+#define MOTOR_PS_SSR_ENABLE_PIN (7)  // Arduino output pin 7 on J4, writing '1' turns on 9V/100A power supply
+
+#define SOLENOID_PS_SSR_ENABLE_PIN (8)
 
 //    Arudino Analog In 0, measures the voltage from the draw-string position sensor
 #define DRAW_STRING_IN (0)
@@ -262,7 +268,6 @@ Task monitor_wind_sensor(TASK_SECOND * 5, TASK_FOREVER, &monitor_wind_sensor_cal
 
 void control_hydraulics_callback();
 void monitor_position_limits_callback();
-void monitor_motor_on_time_callback();
 void monitor_stall_and_motor_current_callback();
 
 /*
@@ -275,7 +280,6 @@ Task print_status_to_serial(TASK_SECOND, TASK_FOREVER, &print_status_to_serial_c
 Task control_hydraulics(TASK_SECOND * 10, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
 
 Task monitor_position_limits(50, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
-Task monitor_motor_on_time(TASK_SECOND * 2, TASK_FOREVER, &monitor_motor_on_time_callback, &ts, true);
 Task monitor_stall_and_motor_current(200, TASK_FOREVER, &monitor_stall_and_motor_current_callback, &ts, false);
 
 /*
@@ -553,6 +557,18 @@ void monitor_buttons_callback() {
 
 unsigned long time_of_last_use_of_motor_power_supply;
 
+void turn_on_motor_power_supply(void) 
+{
+  unsigned long current_second = millis() / 1000;
+
+  // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
+  // input.  That allows us to drive it high with a power-supply over ride switch without having that
+  // conflict with the ATMega output driver.
+  pinMode(MOTOR_PS_SSR_ENABLE_PIN, OUTPUT);
+  digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, HIGH);
+  time_of_last_use_of_motor_power_supply = current_second;
+}
+
 void turn_off_motor_power_supply_if_idle(void) 
 {
   unsigned long current_second = millis() / 1000;
@@ -561,19 +577,30 @@ void turn_off_motor_power_supply_if_idle(void)
     // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
     // input.  That allows us to drive it high with a power-supply over ride switch without having that
     // conflict with the ATMega output driver.
-    pinMode(SSR_ENABLE_OUT, INPUT);
-    digitalWrite(SSR_ENABLE_OUT, LOW);  // Just so we can query later
+    pinMode(MOTOR_PS_SSR_ENABLE_PIN, INPUT);
+    digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, LOW);  // We write the bit with a zero ust so we can query later to see the state 
   }
 }
 
-void turn_on_motor_power_supply(void) 
+
+void turn_on_solenoid_power_supply(void) 
 {
-  if (digitalRead(SSR_ENABLE_OUT) == LOW) {
-    pinMode(SSR_ENABLE_OUT, OUTPUT);
-    digitalWrite(SSR_ENABLE_OUT, HIGH);
+  if (digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == LOW) {
+    pinMode(SOLENOID_PS_SSR_ENABLE_PIN, OUTPUT);
+    digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, HIGH);
     delay(2000);  // Wait for supply to develop power
   }
-  time_of_last_use_of_motor_power_supply = millis() / 1000UL;
+  solenoid_power_supply_on_time_in_seconds = millis() / 1000UL;
+}
+
+void turn_off_solenoid_power_supply(void) 
+{
+    // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
+    // input.  That allows us to drive it high with a power-supply over ride switch without having that
+    // conflict with the ATMega output driver.
+  pinMode(SOLENOID_PS_SSR_ENABLE_PIN, INPUT);
+  digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, LOW);  // Just so we can query later
+  solenoid_power_supply_on_time_in_seconds = 0;
 }
 
 /*
@@ -601,6 +628,7 @@ void stop_driving_panels(const __FlashStringHelper *who_called)
   lcd.print(F("Stopped "));
   lcd.print((int)position_sensor_val);
   vtd_timeout = 10;
+  turn_off_solenoid_power_supply();
 }
 
 /*
@@ -646,27 +674,30 @@ void drive_panels_up(void)
    Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going up when this was called.
 */
-void drive_panels_down(const __FlashStringHelper *why) 
+void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_without_power) 
 {
   if (at_lower_position_limit || panels_retracted) {
     return;
   } else if (panels_going_up) {
     fail(F("drive_panels_down"));
   } else {
+    turn_on_solenoid_power_supply(); // Release check valve so that panels can go down
     Serial.print(F("# retract: "));
     Serial.println(why);
     lcd.setCursor(0, 1);
     lcd.print(F("Going down "));
     vtd_timeout = 10;
-    quad_relay.turnRelayOn(RELAY_DOWN);
-    monitor_position_limits.enable();
-    turn_on_motor_power_supply();
+    if (let_panels_fall_without_power == false) {
+      quad_relay.turnRelayOn(RELAY_DOWN);
+      turn_on_motor_power_supply();
+      monitor_stall_and_motor_current.enable();
+    }
+    
     panels_going_down = true;
     stall_start_time = 0;
     under_current_start_time = 0;
     panels_retracted = true;
     monitor_position_limits.enable();
-    monitor_stall_and_motor_current.enable();
   }
 }
 
@@ -946,7 +977,6 @@ void print_status_to_serial_callback(void)
 /*
      Check to see if the system has reached its high or low limits and stop the panels from moving if so.
 */
-
 void monitor_position_limits_callback() 
 {
   if (position_sensor_failed) {
@@ -957,6 +987,14 @@ void monitor_position_limits_callback()
     }
     if (panels_going_down && position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
       stop_driving_panels(F("lower limit reached"));
+    }
+    if (let_panels_fall_without_power_global) {
+      unsigned long now = millis() / 1000UL;
+      if ((now - solenoid_power_supply_on_time_in_seconds) > max_solenoid_on_time_in_seconds) {
+        // Give up and drive them down
+        panels_retracted = false;
+        drive_panels_down(F("giving up on unpowered retraction"), false);
+      }
     }
   }
 }
@@ -1101,7 +1139,7 @@ void monitor_rain_sensor_callback()
     Serial.println(F("# alert rain stow"));
     calvals.operation_mode = rain_stow_mode;
     if (!at_lower_position_limit) {
-      drive_panels_down(F("rain-stow"));
+      drive_panels_down(F("rain-stow"), false);
     }
     monitor_rain_sensor.setInterval(60UL * 60UL * 1000UL); // 60 minutes so that we don't turn the rain sensor on too often
 
@@ -1170,59 +1208,11 @@ void monitor_wind_sensor_callback()
           Serial.print((int)wind_speed_knots);
           calvals.operation_mode = wind_stow_mode;
           if (!at_lower_position_limit) {
-            drive_panels_down(F("wind-stow"));
+            drive_panels_down(F("wind-stow"), false);
           }
         }
       }
     }
-  }
-}
-
-/*
-   Model the temperature of the hydraulic motor and the contactor and the check valve solenoid by keeping track
-   of how long they are on vs. how long they are off. This runs all the time doing this modeling.  This will stop
-   the motor if it has run too long without time to cool down.  Other functions use the 'motor_cooling_off' as
-   well to decide to not start running the motor when they otherwise would.
-*/
-void monitor_motor_on_time_callback() 
-{
-  unsigned long time_now = millis();
-  static unsigned long last_time_now = 0;                 // Values from millis() start at zero when system starts, so this is correct initialization vale
-  unsigned long time_elapsed = time_now - last_time_now;  // Works even if we had a roll-over
-
-  last_time_now = time_now;
-
-  if (panels_going_up || panels_going_down) {
-    accumulated_motor_on_time += time_elapsed;
-    int amps = motor_amps();
-    if (panels_going_up && amps > motor_amps_up_limit) {
-      stop_driving_panels(F("current-limit while going up"));
-      Serial.print("# alert amps=");
-      Serial.println(amps);
-      calvals.operation_mode = no_panel_movement_mode;
-    } else if (panels_going_down && amps > motor_amps_down_limit) {
-      stop_driving_panels(F("current-limit while going down"));
-      Serial.print("# alert amps=");
-      Serial.println(amps);
-      calvals.operation_mode = no_panel_movement_mode;
-    }
-  } else {
-    // For every second the motor is on, let it cool for a number of (configurable) seconds.
-    unsigned long delta = time_elapsed / accumulated_motor_on_time_ageing_rate;
-    if (accumulated_motor_on_time < delta) {
-      accumulated_motor_on_time = 0;
-    } else {
-      accumulated_motor_on_time -= delta;
-    }
-  }
-  if (motor_cooling_off == false) {
-    bool motor_might_be_hot = accumulated_motor_on_time > accumulated_motor_on_time_limit;
-    if (motor_might_be_hot && (panels_going_up || panels_going_down)) {
-      motor_cooling_off = true;
-      stop_driving_panels(F("motor on-time limit"));
-    }
-  } else if (accumulated_motor_on_time < (accumulated_motor_on_time_limit - motor_on_time_hysterisis)) {
-    motor_cooling_off = false;
   }
 }
 
@@ -1353,7 +1343,7 @@ void drive_panels_to_desired_position(void)
   } else if (lower_hour <= h && dark) {
     turn_off_rain_sensor();  // With panels all the way down, no need to monitor for rain
     monitor_rain_sensor.disable();
-    drive_panels_down(F("stowing for night"));
+    drive_panels_down(F("stowing for night"), let_panels_fall_without_power_global);
   }
   // At midnight, reset the number of daily stalls
   if (h == 0 && daily_stalls > 0) {
@@ -1366,6 +1356,7 @@ void drive_panels_to_desired_position(void)
 void control_hydraulics_callback() 
 {
   turn_off_motor_power_supply_if_idle();
+
   if (panels_going_up || panels_going_down || motor_cooling_off || position_sensor_failed || millis() < 10000) {
     return;
   }
