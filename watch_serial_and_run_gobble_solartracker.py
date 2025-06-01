@@ -7,7 +7,7 @@ import serial
 import errno
 
 DEVICE = "/dev/tty.usbserial-11440"
-SCRIPT = "/Users/robertbedichek/bin/gobble_solartracker.py"
+SCRIPT = os.path.expanduser('~/bin/gobble_solartracker.py')
 CHECK_INTERVAL = 60  # seconds
 
 
