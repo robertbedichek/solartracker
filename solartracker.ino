@@ -33,8 +33,10 @@
 char cbuf[55];
 
 const bool let_panels_fall_without_power_global = true;
-const unsigned long max_solenoid_on_time_in_seconds = 1800;
-unsigned long solenoid_power_supply_on_time_in_seconds;
+const unsigned long max_solenoid_on_time = 1800 * 1000UL;
+const unsigned long max_solenoid_off_time = 2700 * 1000UL;
+unsigned long solenoid_power_supply_on_time;  // Value of millis() when we last turned on the solenoid, 0 when off
+unsigned long solenoid_power_supply_off_time; // Value of millis() when we last turned off thesolenoid, 0 when on
 
 
 // The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 3 is for "down".
@@ -589,18 +591,24 @@ void turn_on_solenoid_power_supply(void)
     pinMode(SOLENOID_PS_SSR_ENABLE_PIN, OUTPUT);
     digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, HIGH);
     delay(2000);  // Wait for supply to develop power
+    Serial.println(F("# solenoid power on"));
   }
-  solenoid_power_supply_on_time_in_seconds = millis() / 1000UL;
+  solenoid_power_supply_on_time = millis();
+  solenoid_power_supply_off_time = 0;
 }
 
 void turn_off_solenoid_power_supply(void) 
 {
+  if (digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == HIGH) {
     // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
     // input.  That allows us to drive it high with a power-supply over ride switch without having that
     // conflict with the ATMega output driver.
-  pinMode(SOLENOID_PS_SSR_ENABLE_PIN, INPUT);
-  digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, LOW);  // Just so we can query later
-  solenoid_power_supply_on_time_in_seconds = 0;
+    pinMode(SOLENOID_PS_SSR_ENABLE_PIN, INPUT);
+    digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, LOW);  // Just so we can query later
+    solenoid_power_supply_on_time = 0;
+    solenoid_power_supply_off_time = millis();
+    Serial.println(F("# solenoid power off"));
+  }
 }
 
 /*
@@ -985,15 +993,22 @@ void monitor_position_limits_callback()
     if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
       stop_driving_panels(F("upper limit reached"));
     }
-    if (panels_going_down && position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
-      stop_driving_panels(F("lower limit reached"));
-    }
-    if (let_panels_fall_without_power_global) {
-      unsigned long now = millis() / 1000UL;
-      if ((now - solenoid_power_supply_on_time_in_seconds) > max_solenoid_on_time_in_seconds) {
-        // Give up and drive them down
-        panels_retracted = false;
-        drive_panels_down(F("giving up on unpowered retraction"), false);
+    if (panels_going_down) {
+      if (position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
+        stop_driving_panels(F("lower limit reached"));
+      }
+      if (let_panels_fall_without_power_global) {
+        if (hour(arduino_time) == 8) {
+          // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
+          stop_driving_panels(F("letting panels fall"));
+        }
+        // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
+        if (solenoid_power_supply_on_time != 0 && (millis() - solenoid_power_supply_on_time) > max_solenoid_on_time) {
+          turn_off_solenoid_power_supply();
+        }
+        if (solenoid_power_supply_off_time != 0 && (millis() - solenoid_power_supply_off_time) > max_solenoid_off_time) {
+          turn_on_solenoid_power_supply();
+        }
       }
     }
   }
