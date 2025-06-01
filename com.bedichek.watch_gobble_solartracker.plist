@@ -4,12 +4,12 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.bedichek.watch_gobble_tracker</string>
+    <string>com.bedichek.watch_gobble_solartracker</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/robertbedichek/bin/watch_serial_and_run_gobble_tracker.py</string>
+        <string>/Users/robertbedichek/bin/watch_serial_and_run_gobble_solartracker.py</string>
     </array>
 
     <key>RunAtLoad</key>
