@@ -590,8 +590,7 @@ void turn_on_solenoid_power_supply(void)
   if (digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == LOW) {
     pinMode(SOLENOID_PS_SSR_ENABLE_PIN, OUTPUT);
     digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, HIGH);
-    delay(2000);  // Wait for supply to develop power
-    Serial.println(F("# solenoid power on"));
+    delay(2000);  // Wait for supply to develop powers
   }
   solenoid_power_supply_on_time = millis();
   solenoid_power_supply_off_time = 0;
@@ -607,7 +606,6 @@ void turn_off_solenoid_power_supply(void)
     digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, LOW);  // Just so we can query later
     solenoid_power_supply_on_time = 0;
     solenoid_power_supply_off_time = millis();
-    Serial.println(F("# solenoid power off"));
   }
 }
 
@@ -617,8 +615,10 @@ void turn_off_solenoid_power_supply(void)
 */
 void stop_driving_panels(const __FlashStringHelper *who_called) 
 {
-  Serial.print(F("# stop_driving_panels(), called by "));
-  Serial.println(who_called);
+  if (who_called != (void *)0) {
+    Serial.print(F("# stop_driving_panels(), called by "));
+    Serial.println(who_called);
+  }
 
   quad_relay.turnRelayOff(RELAY_UP);
   quad_relay.turnRelayOff(RELAY_DOWN);
@@ -991,16 +991,16 @@ void monitor_position_limits_callback()
     stop_driving_panels(F("failed position sensor"));
   } else {
     if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
-      stop_driving_panels(F("upper limit reached"));
+      stop_driving_panels((void *)0 /* F("upper limit reached") */);
     }
     if (panels_going_down) {
       if (position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
-        stop_driving_panels(F("lower limit reached"));
+        stop_driving_panels((void *)0 /* F("lower limit reached") */);
       }
       if (let_panels_fall_without_power_global) {
         if (hour(arduino_time) == 8) {
           // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
-          stop_driving_panels(F("letting panels fall"));
+          stop_driving_panels((void *)0 /* F("letting panels fall") */);
         }
         // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
         if (solenoid_power_supply_on_time != 0 && (millis() - solenoid_power_supply_on_time) > max_solenoid_on_time) {
@@ -1057,18 +1057,21 @@ void monitor_stall_and_motor_current_callback()
   }
   // Now check to see if the hydraulic motor is taking too little or too much current
   int amps = motor_amps();
-  char vbuf[10];
-  dtostrf(supply_volts, 6, 3, vbuf);
+  const bool verbose_motor = false;
+  if (verbose_motor) {
+    char vbuf[10];
+    dtostrf(supply_volts, 6, 3, vbuf);
 
-  snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
-             hour(arduino_time),
-             minute(arduino_time),
-             second(arduino_time),
-             (unsigned)position_sensor_val,
-             amps,
-            vbuf);
-  
-  Serial.println(cbuf);
+    snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
+              hour(arduino_time),
+              minute(arduino_time),
+              second(arduino_time),
+              (unsigned)position_sensor_val,
+              amps,
+              vbuf);
+    
+    Serial.println(cbuf);
+  }
   if (amps < motor_current_threshold_low) {
     unsigned long now = millis();
     if (under_current_start_time == 0) {
@@ -1100,7 +1103,6 @@ bool is_raining(void)
   if (quad_relay.getState(RELAY_RAIN_SENSOR) == false) {
     quad_relay.turnRelayOn(RELAY_RAIN_SENSOR);
     delay(100); // Hopefully the relay will close in less than 100 milliseconds
-    Serial.println(F("# rain sensor on"));
   }
 
   // Take ar number of samples to get a better estimate of actual voltage.
@@ -1118,7 +1120,6 @@ void turn_off_rain_sensor(void)
 {
   if (quad_relay.getState(RELAY_RAIN_SENSOR)) {
      quad_relay.turnRelayOff(RELAY_RAIN_SENSOR);
-    Serial.println(F("# rain sensor off"));
   }
 }
 
@@ -1242,7 +1243,7 @@ void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback
     fail(F("MP"));
   }
   if (position_sensor_val >= desired_position) {
-    stop_driving_panels(F("target position reached"));
+    stop_driving_panels((void *)0 /* position limit reached */);
   }
 }
 
