@@ -238,7 +238,7 @@ bool rain_stow_disable = false;
 Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 void monitor_wind_sensor_callback();
-bool wind_stow_disable = true;
+bool wind_stow_disabled = true;
 float wind_speed_knots = 0.0;             // In knots
 float recent_max_wind_speed_knots = 0.0;  // Maximum recorded value since we started
 
@@ -1205,6 +1205,13 @@ void monitor_wind_sensor_callback()
   static unsigned wind_stow_mode_delay;
   static unsigned high_wind_count;
 
+  if (wind_stow_disabled) {
+    if (calvals.operation_mode == wind_stow_mode) { 
+      Serial.println(F("# alert leaving wind-stow mode due to it being disabled"));
+      calvals.operation_mode = position_mode;
+    }
+    return;
+  }
   if (wind_speed_knots < low_wind_threshold) {  // If the wind is calm, start counting down
     high_wind_count = 0;
     if (calvals.operation_mode == wind_stow_mode) {
@@ -1455,8 +1462,8 @@ void monitor_serial_console_callback(void)
           break;
 
         case 'w':
-          wind_stow_disable = !wind_stow_disable;
-          if (wind_stow_disable) {
+          wind_stow_disabled = !wind_stow_disabled;
+          if (wind_stow_disabled) {
             Serial.println(F("# wind stow disabled"));
             monitor_wind_sensor.disable();
             if (calvals.operation_mode == wind_stow_mode) {
@@ -1466,7 +1473,6 @@ void monitor_serial_console_callback(void)
             Serial.println(F("# wind stow enabled"));
             monitor_wind_sensor.enable();
           }
-
           break;
 
         case 'r':
