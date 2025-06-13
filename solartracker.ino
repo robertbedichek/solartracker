@@ -68,6 +68,8 @@ Adafruit_ADS1115 ads; /* Use this for the 16-bit version */
 
 //   All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
 time_t arduino_time;
+bool date_set = false;
+bool time_set = false;
 
 //   If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on
 //  the time of day being valid.
@@ -113,7 +115,7 @@ const int position_hysteresis = 1;
 unsigned low_current_count = 0;
 
 const unsigned motor_current_threshold_low = 10;
-const unsigned motor_current_threshold_high = 95;
+const unsigned motor_current_threshold_high = 100;
 bool panels_retracted;
 
 //   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
@@ -164,8 +166,6 @@ struct calvals_s {
   enum mode_e operation_mode;  // Mode to start in
 } calvals;
 
-const int motor_amps_down_limit = 40;
-const int motor_amps_up_limit = 99;
 
 const float low_wind_threshold = 6;
 const float high_wind_threshold = 12;
@@ -184,27 +184,10 @@ float supply_volts;  // Tap voltage converted to supply voltage
 */
 float contactor_temperature_F;  // Degrees in Farenheight of temperature sensor in controller box
 
-/*
-   We have an Attopilot current sensor on the 4V line going from the Li-ion pack to the contactor.  Its voltage output
-   is unused.  Its current output goes to Arduino Analog input 3.
-*/
-
-float max_motor_amps = 0;  // Max recorded current since we started
 
 float solar_volts;
 
-float rain_sensor_volts;
 
-/*
-   This is from the 1000mm pull-string sensor that tells us where the panels are.
-*/
-float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
-bool position_sensor_failed = false;      // Set true if the position sensor value is ever out of range
-unsigned daily_stalls;                    // Zeroed at midnight, incremented on each motor stall
-unsigned long stall_start_time;           // Incremented when no change in position while motor on
-unsigned long under_current_start_time;
-unsigned last_position_sensor_val;        // Position value at last call to status print
-unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
 /*
     'dark' is when
@@ -213,76 +196,95 @@ unsigned last_position_sensor_val_stall;  // Position sensor value at last sampl
 */
 bool dark;
 
-/*
-   Calculated from 'position_sensor_val' and the position limit calibration values.
-*/
-bool at_upper_position_limit = false, at_lower_position_limit = false;
 
-/*
-   The number of milliseconds the motor has been on in total, but aged (so it goes down with time that the motor is off).  This is used to
-   decide how much we've been running the contactor and motor.
-*/
-unsigned long accumulated_motor_on_time = 0;
+void display_status_on_lcd_callback();
+Task display_status_on_lcd(TASK_SECOND, TASK_FOREVER, &display_status_on_lcd_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
+void monitor_buttons_callback();
+Task monitor_buttons(100, TASK_FOREVER, &monitor_buttons_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
+void monitor_lcd_backlight_callback();
 
-/*
-   This is set when the accumulated motor on time is greater than its limit and is reset when the on-time falls below the hystersis value.
-*/
-bool motor_cooling_off = false;
-
-bool motor_up_overcurrent = false;
-bool motor_down_overcurrent = false;
-
-/*
-   Counts down when the backlight is on.  When it is zero, we turn the backlight off.  Units are seconds.
-*/
+//   Counts down when the backlight is on.  When it is zero, we turn the backlight off.  Units are seconds.
 unsigned backlight_timer;
 
+Task monitor_lcd_backlight(TASK_SECOND, TASK_FOREVER, &monitor_lcd_backlight_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
+void monitor_cron_callback();
+Task monitor_cron(TASK_SECOND * 3600 * 4, TASK_FOREVER, &monitor_cron_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
+void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback();
+
+//   Calculated from 'position_sensor_val' and the position limit calibration values.
+bool at_upper_position_limit = false, at_lower_position_limit = false;
 /*
-   Wind speed variables
+   This is from the 1000mm pull-string sensor that tells us where the panels are.
 */
+float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
+bool position_sensor_failed = false;      // Set true if the position sensor value is ever out of range
+unsigned last_position_sensor_val;        // Position value at last call to status print
+unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
+
+
+
+Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND / 10, TASK_FOREVER,
+                                                                        &monitor_upward_moving_panels_and_stop_when_target_position_reached_callback, &ts, false);
+
+//---------------------------------------------------------------------------------------------------
+void monitor_rain_sensor_callback();
+float rain_sensor_volts;
+
+bool rain_stow_disable = false;                                                                        
+Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
+void monitor_wind_sensor_callback();
+bool wind_stow_disable = true;
 float wind_speed_knots = 0.0;             // In knots
 float recent_max_wind_speed_knots = 0.0;  // Maximum recorded value since we started
 
-// Forward definitions of the call-back functions that we pass to the task scheduler.
+Task monitor_wind_sensor(TASK_SECOND * 5, TASK_FOREVER, &monitor_wind_sensor_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
 
 void read_time_and_sensor_inputs_callback();
+Task read_time_and_sensor_inputs(500, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
 
-/*
-    The next five callbacks and tasks interact with I2C devices.
-*/
-void display_status_on_lcd_callback();
-void monitor_buttons_callback();
-void monitor_lcd_backlight_callback();
 void print_status_to_serial_callback();
-void monitor_cron_callback();
-void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback();
-void monitor_rain_sensor_callback();
-void monitor_wind_sensor_callback();
-
-Task display_status_on_lcd(TASK_SECOND, TASK_FOREVER, &display_status_on_lcd_callback, &ts, true);
-Task monitor_buttons(100, TASK_FOREVER, &monitor_buttons_callback, &ts, true);
-Task monitor_lcd_backlight(TASK_SECOND, TASK_FOREVER, &monitor_lcd_backlight_callback, &ts, true);
-Task monitor_cron(TASK_SECOND * 3600 * 4, TASK_FOREVER, &monitor_cron_callback, &ts, true);
-Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND / 10, TASK_FOREVER,
-                                                                        &monitor_upward_moving_panels_and_stop_when_target_position_reached_callback, &ts, false);
-Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
-Task monitor_wind_sensor(TASK_SECOND * 5, TASK_FOREVER, &monitor_wind_sensor_callback, &ts, true);
-
+Task print_status_to_serial(TASK_SECOND, TASK_FOREVER, &print_status_to_serial_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
 void control_hydraulics_callback();
+Task control_hydraulics(TASK_SECOND * 10, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
+//---------------------------------------------------------------------------------------------------
 void monitor_position_limits_callback();
+Task monitor_position_limits(50, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
+//---------------------------------------------------------------------------------------------------
+
 void monitor_stall_and_motor_current_callback();
 
-/*
-   These are the tasks that are the heart of the logic that controls this system.  Some run periodically and are always enabled.  Some run only
-   when the panels are in motion.
-*/
+//   We have an Attopilot current sensor on the 4V line going from the Li-ion pack to the contactor.  Its voltage output
+//   is unused.  Its current output goes to Arduino Analog input 3.
+float max_motor_amps = 0;  // Max recorded current since we started
 
-Task read_time_and_sensor_inputs(500, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
-Task print_status_to_serial(TASK_SECOND, TASK_FOREVER, &print_status_to_serial_callback, &ts, true);
-Task control_hydraulics(TASK_SECOND * 10, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
+const int motor_amps_down_limit = 40;
+const int motor_amps_up_limit = 99;
 
-Task monitor_position_limits(50, TASK_FOREVER, &monitor_position_limits_callback, &ts, false);
+//   This is set when the accumulated motor on time is greater than its limit and is reset when the on-time falls below the hystersis value.
+bool motor_cooling_off = false;
+
+//   The number of milliseconds the motor has been on in total, but aged (so it goes down with time that the motor is off).  This is used to
+//   decide how much we've been running the contactor and motor.
+unsigned long accumulated_motor_on_time = 0;
+
+bool motor_up_overcurrent = false;
+bool motor_down_overcurrent = false;
+unsigned daily_stalls;                    // Zeroed at midnight, incremented on each motor stall
+unsigned long stall_start_time;           // Incremented when no change in position while motor on
+unsigned long under_current_start_time;
+
 Task monitor_stall_and_motor_current(200, TASK_FOREVER, &monitor_stall_and_motor_current_callback, &ts, false);
+//---------------------------------------------------------------------------------------------------
+void monitor_serial_console_callback(void);
+Task monitor_serial_console(TASK_SECOND, TASK_FOREVER, &monitor_serial_console_callback, &ts, true);
 
 /*
    Keep track of whether we are driving the panels up or down.  These two should never be true at the same time.
@@ -616,7 +618,7 @@ void turn_off_solenoid_power_supply(void)
 void stop_driving_panels(const __FlashStringHelper *who_called) 
 {
   if (who_called != (void *)0) {
-    Serial.print(F("# stop_driving_panels(), called by "));
+    Serial.print(F("# stop_driving_panels(): "));
     Serial.println(who_called);
   }
 
@@ -918,7 +920,7 @@ void print_status_to_serial_callback(void)
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
      abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
-     skipped_record_counter++ > 1200) {
+     skipped_record_counter++ > 1000) {
 
     last_position_sensor_val = position_sensor_val;
     last_operation_mode = calvals.operation_mode;
@@ -1084,7 +1086,9 @@ void monitor_stall_and_motor_current_callback()
 
     // If the motor is taking too much current, stop it immediately
     if (amps > motor_current_threshold_high) {
-      stop_driving_panels(F("# alert high current"));
+      stop_driving_panels(F("high current"));
+      Serial.print(F("# amps="));
+      Serial.println(amps);
     }
   }
   last_position_sensor_val_stall = position_sensor_val;
@@ -1400,6 +1404,99 @@ void control_hydraulics_callback()
   }
 }
 
+// Called frequently to poll for and act on received console input.  This recognizes characters
+// that correspond to keys on the controller, 's' for select, '+' for the plus key, and '-' for the minus key.
+
+void monitor_serial_console_callback(void)
+{
+  static char command_buf[20];
+
+  while (Serial.available() > 0) {  // Check if data is available to read
+    char received_char = Serial.read();  // Read one character
+    int l = strlen(command_buf);
+    if (l >= sizeof(command_buf) - 1) {
+      Serial.println(F("# command buffer overflow"));
+      command_buf[0] = '\0';
+      break;
+    }
+    if (received_char == '\n') {
+      Serial.print(F("# Received: "));
+      Serial.println(command_buf);
+
+      switch (command_buf[0]) {   
+        case 'd': // Set date command, "d year-month-day", e.g., "t 2025-05-23" to set the date
+        {
+          int year, month, day;
+          sscanf(command_buf + 2, "%d-%d-%d", &year, &month, &day);
+          setTime(hour(arduino_time), minute(arduino_time), second(arduino_time), day, month, year);
+          date_set = true;
+        }
+        break; 
+
+        case 't': // Set time command, "t hh:mm:ss", e.g., "t 9:23:33" to set the time.
+        {
+          int hh, mmin, ss;
+          sscanf(command_buf + 2, "%d:%d:%d", &hh, &mmin, &ss);
+          setTime(hh, mmin, ss, day(arduino_time), month(arduino_time), year(arduino_time));
+          time_set = true;
+        }
+        break;
+
+        case 's':
+//          select_key_pressed = true;
+          break;
+
+        case '+':
+  //        plus_key_pressed = true;
+          break;
+
+        case '-':
+    //      minus_key_pressed = true;
+          break;
+
+        case 'w':
+          wind_stow_disable = !wind_stow_disable;
+          if (wind_stow_disable) {
+            Serial.println(F("# wind stow disabled"));
+            monitor_wind_sensor.disable();
+            if (calvals.operation_mode == wind_stow_mode) {
+              calvals.operation_mode = position_mode;
+            }
+          } else {
+            Serial.println(F("# wind stow enabled"));
+            monitor_wind_sensor.enable();
+          }
+
+          break;
+
+        case 'r':
+          rain_stow_disable = !rain_stow_disable;
+          if (rain_stow_disable) {
+            Serial.println(F("# rain stow disabled"));
+            monitor_rain_sensor.disable();
+            turn_off_rain_sensor();
+            if (calvals.operation_mode == rain_stow_mode) {
+              calvals.operation_mode = position_mode;
+            }
+          } else {
+            Serial.println(F("# rain stow enabled"));
+            monitor_rain_sensor.enable();
+          }
+          break;
+
+        default:
+          Serial.print(F("# Unknown command: "));
+          Serial.println(command_buf);
+          Serial.println(F("# choices are: 'd year-month-day', 't hour:minute:second','s', +, -"));
+          break;
+      }
+      command_buf[0] = '\0';
+    } else {
+      command_buf[l] = received_char;
+      command_buf[l+1] = '\0';
+    }
+  }
+}
 /*
    This is called every four hours.  It will do something (maybe more than once) in the early hours.
 */
@@ -1489,7 +1586,9 @@ void setup()
   if (set_rtc_time_from_build_time) {
     set_rtc_from_build_date_and_time();
   }
-  set_arduino_time_from_rtc();
+  if (!date_set && !time_set) {
+    set_arduino_time_from_rtc();
+  }
 
   Serial.print(F("\n\r# reboot SolarTracker "));
   Serial.print(F(__DATE__));
