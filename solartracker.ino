@@ -97,7 +97,6 @@ const unsigned long motor_max_on_time_default = 90000;
 const int motor_on_time_hysterisis = 20000;
 
 const unsigned long accumulated_motor_on_time_limit = 60000;
-const int accumulated_motor_on_time_ageing_rate = 1;
 
 const int position_hysteresis = 1;
 unsigned low_current_count = 0;
@@ -207,7 +206,6 @@ bool at_upper_position_limit = false, at_lower_position_limit = false;
    This is from the 1000mm pull-string sensor that tells us where the panels are.
 */
 float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
-bool position_sensor_failed = false;      // Set true if the position sensor value is ever out of range
 unsigned last_position_sensor_val;        // Position value at last call to status print
 unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
@@ -327,7 +325,6 @@ enum val_to_display_e { vtd_none = 0,
                         vtd_motor_amps_limit,
                         vtd_wind_speed_limit,
                         vtd_accumulated_motor_on_time_limit,
-                        vtd_accumulated_motor_on_time_aging_rate,
                         vtd_last
 } vtd_current = vtd_none;
 
@@ -459,12 +456,6 @@ void vtd_display_current(void) {
       lcd.print(F("Accum motor limit"));
       lcd.setCursor(0, 1);
       bytes = lcd.print(accumulated_motor_on_time_limit / 1000);
-      break;
-
-    case vtd_accumulated_motor_on_time_aging_rate:
-      lcd.print(F("Accum aging rate "));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(accumulated_motor_on_time_ageing_rate);
       break;
 
     default:
@@ -843,9 +834,7 @@ void display_status_on_lcd_callback()
     bytes = lcd.print(c1);
 
     char c2 = ' ';
-    if (position_sensor_failed) {
-      c2 = 'F';
-    } else if (at_upper_position_limit) {
+    if (at_upper_position_limit) {
       c2 = 'u';
     } else if (at_lower_position_limit) {
       c2 = 'l';
@@ -978,29 +967,25 @@ void print_status_to_serial_callback(void)
 */
 void monitor_position_limits_callback() 
 {
-  if (position_sensor_failed) {
-    stop_driving_panels(F("failed position sensor"));
-  } else {
-    if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
-      last_drive_panels_up_time = millis();
-      stop_driving_panels((void *)0 /* F("upper limit reached") */);
+  if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
+    last_drive_panels_up_time = millis();
+    stop_driving_panels((void *)0 /* F("upper limit reached") */);
+  }
+  if (panels_going_down) {
+    if (position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
+      stop_driving_panels((void *)0 /* F("lower limit reached") */);
     }
-    if (panels_going_down) {
-      if (position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
-        stop_driving_panels((void *)0 /* F("lower limit reached") */);
+    if (let_panels_fall_without_power_global) {
+      if (hour(now()) == 8) {
+        // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
+        stop_driving_panels((void *)0 /* F("letting panels fall") */);
       }
-      if (let_panels_fall_without_power_global) {
-        if (hour(now()) == 8) {
-          // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
-          stop_driving_panels((void *)0 /* F("letting panels fall") */);
-        }
-        // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
-        if (solenoid_power_supply_on_time != 0 && (millis() - solenoid_power_supply_on_time) > max_solenoid_on_time) {
-          turn_off_solenoid_power_supply();
-        }
-        if (solenoid_power_supply_off_time != 0 && (millis() - solenoid_power_supply_off_time) > max_solenoid_off_time) {
-          turn_on_solenoid_power_supply();
-        }
+      // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
+      if (solenoid_power_supply_on_time != 0 && (millis() - solenoid_power_supply_on_time) > max_solenoid_on_time) {
+        turn_off_solenoid_power_supply();
+      }
+      if (solenoid_power_supply_off_time != 0 && (millis() - solenoid_power_supply_off_time) > max_solenoid_off_time) {
+        turn_on_solenoid_power_supply();
       }
     }
   }
@@ -1342,7 +1327,7 @@ void drive_panels_to_desired_position(void)
   // If it is the right time of day to raise the panels, we haven't stalled too many times today, and it has
   // been at least 30 minutes since the last time we raised the panels, then consider further raising them
 
-  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (last_drive_panels_up_time - millis()) > 30 * 60 * 1000UL) {
+  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (millis() - last_drive_panels_up_time) > 30 * 60 * 1000UL) {
     monitor_rain_sensor.enable();
     int position_range = calvals.position_upper_limit - calvals.position_lower_limit;
     int minute_range = (top_position_hour - raise_hour) * 60;
@@ -1380,7 +1365,7 @@ void control_hydraulics_callback()
 {
   turn_off_motor_power_supply_if_idle();
 
-  if (panels_going_up || panels_going_down || motor_cooling_off || position_sensor_failed) {
+  if (panels_going_up || panels_going_down || motor_cooling_off) {
     return;
   }
 
@@ -1390,9 +1375,6 @@ void control_hydraulics_callback()
 
     case position_mode:
       if (time_of_day_valid) {
-        if (position_sensor_failed) {
-          fail(F("PS"));
-        }
         drive_panels_to_desired_position();
       }
       break;
@@ -1436,11 +1418,13 @@ void monitor_serial_console_callback(void)
           
           {
             tmElements_t tm;
-            RTC.read(tm);
+            if (RTC.read(tm) == false) {
+              Serial.println(F("# alert RTC read failed");
+            }
             tm.Year = host_year;
             tm.Month = host_month;
             tm.Day = host_day;
-            if (RTC.write(tm)) {
+            if (RTC.write(tm) == false) {
               Serial.print(F("# alert RTC write failed"));
             }
           }
@@ -1456,11 +1440,13 @@ void monitor_serial_console_callback(void)
 
           {
             tmElements_t tm;
-            RTC.read(tm);
+            if (RTC.read(tm) == false) {
+              Serial.println(F("# alert RTC read failed");
+            }
             tm.Hour = host_hour;
             tm.Minute = host_minute;
             tm.Second = host_second;
-            if (RTC.write(tm)) {
+            if (RTC.write(tm) == false) {
               Serial.print(F("# alert RTC write failed"));
             }
           }
@@ -1538,19 +1524,6 @@ void monitor_cron_callback(void)
   }
 }
 
-int dst_correction(tmElements_t *tm) {
-  if (tm->Month > 3 && tm->Month < 11) {
-    return 1;
-  }
-  if (tm->Month == 3 && tm->Day >= 11) {
-    return 1;
-  }
-  if (tm->Month == 11 && tm->Day < 6) {
-    return 1;
-  }
-  return 0;
-}
-
 /*
    Read the RTC chip and set the 'Arduino' time based on it.  We do this on system start and once per day.
    The Arduino clock is not as accurate as the RTC.
@@ -1568,7 +1541,7 @@ void set_arduino_time_from_rtc(void)
              tm.Minute,
              tm.Second);
 
-    setTime(tm.Hour + dst_correction(&tm), tm.Minute, tm.Second, tm.Day, tm.Month, tmYearToCalendar(tm.Year));
+    setTime(tm.Hour, tm.Minute, tm.Second, tm.Day, tm.Month, tmYearToCalendar(tm.Year));
     time_of_day_valid = true;
   } else {
     if (RTC.chipPresent()) {
