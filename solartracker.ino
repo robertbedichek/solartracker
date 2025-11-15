@@ -96,10 +96,7 @@ const unsigned long motor_max_on_time_default = 90000;
 //  rapidly when the limit is reached.
 const int motor_on_time_hysterisis = 20000;
 
-const unsigned long accumulated_motor_on_time_limit = 60000;
-
 const int position_hysteresis = 1;
-unsigned low_current_count = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 100;
@@ -245,20 +242,7 @@ void monitor_stall_and_motor_current_callback();
 
 //   We have an Attopilot current sensor on the 4V line going from the Li-ion pack to the contactor.  Its voltage output
 //   is unused.  Its current output goes to Arduino Analog input 3.
-float max_motor_amps = 0;  // Max recorded current since we started
 
-const int motor_amps_down_limit = 40;
-const int motor_amps_up_limit = 99;
-
-//   This is set when the accumulated motor on time is greater than its limit and is reset when the on-time falls below the hystersis value.
-bool motor_cooling_off = false;
-
-//   The number of milliseconds the motor has been on in total, but aged (so it goes down with time that the motor is off).  This is used to
-//   decide how much we've been running the contactor and motor.
-unsigned long accumulated_motor_on_time = 0;
-
-bool motor_up_overcurrent = false;
-bool motor_down_overcurrent = false;
 unsigned daily_stalls;                    // Zeroed at midnight, incremented on each motor stall
 unsigned long stall_start_time;           // Incremented when no change in position while motor on
 unsigned long under_current_start_time;
@@ -308,7 +292,6 @@ void monitor_lcd_backlight_callback(void) {
 }
 
 enum val_to_display_e { vtd_none = 0,
-                        vtd_max_9V_current,
                         vtd_temperature,
                         vtd_volts,
                         vtd_build_date,
@@ -317,14 +300,12 @@ enum val_to_display_e { vtd_none = 0,
                         vtd_mode,
                         vtd_position,
                         vtd_sun,
-                        vtd_motor_on_time,
                         vtd_max_knots,
                         vtd_position_upper_limit,
                         vtd_position_lower_limit,
-                        /* vtd_time_tilted_up_limit_in_minutes, */ vtd_darkness_threshold,
+                        vtd_darkness_threshold,
                         vtd_motor_amps_limit,
                         vtd_wind_speed_limit,
-                        vtd_accumulated_motor_on_time_limit,
                         vtd_last
 } vtd_current = vtd_none;
 
@@ -402,18 +383,6 @@ void vtd_display_current(void) {
       lcd.write('F');
       break;
 
-    case vtd_max_9V_current:
-      lcd.print(F("Max Motor Amps  "));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(max_motor_amps);
-      break;
-
-    case vtd_motor_on_time:
-      lcd.print(F("Motor-on time   "));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(accumulated_motor_on_time);
-      break;
-
     case vtd_max_knots:
       lcd.print(F("Max windspeed KT"));
       lcd.setCursor(0, 1);
@@ -438,24 +407,10 @@ void vtd_display_current(void) {
       bytes = lcd.print(calvals.darkness_threshold);
       break;
 
-    case vtd_motor_amps_limit:
-      lcd.print(F("Motor amps limit  "));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(motor_amps_down_limit);
-      bytes += lcd.print(F(" "));
-      bytes += lcd.print(motor_amps_up_limit);
-      break;
-
     case vtd_wind_speed_limit:
       lcd.print(F("Wind speed limit"));
       lcd.setCursor(0, 1);
     //  bytes = lcd.print(wind_speed_limit);
-      break;
-
-    case vtd_accumulated_motor_on_time_limit:
-      lcd.print(F("Accum motor limit"));
-      lcd.setCursor(0, 1);
-      bytes = lcd.print(accumulated_motor_on_time_limit / 1000);
       break;
 
     default:
@@ -607,7 +562,6 @@ void stop_driving_panels(const __FlashStringHelper *who_called)
   monitor_position_limits.disable();
   monitor_stall_and_motor_current.disable();
   monitor_upward_moving_panels_and_stop_when_target_position_reached.disable();
-  low_current_count = 0;
   lcd.setCursor(0, 1);
   lcd.print(F("Stopped "));
   lcd.print((int)position_sensor_val);
@@ -818,7 +772,6 @@ void display_status_on_lcd_callback()
     bytes += lcd.print(F(" "));
     bytes += lcd.print(cbuf);
     bytes += lcd.print(F(" "));
-    bytes += lcd.print(max_motor_amps);
     while (bytes < 16) {
       bytes += lcd.print(F(" "));
     }
@@ -828,8 +781,6 @@ void display_status_on_lcd_callback()
       c1 = 'U';
     } else if (panels_going_down) {
       c1 = 'D';
-    } else if (motor_cooling_off) {
-      c1 = 'C';
     }
     bytes = lcd.print(c1);
 
@@ -908,7 +859,7 @@ void print_status_to_serial_callback(void)
     skipped_record_counter = 0;
 
     if (line_counter == 0) {
-      Serial.println(F("# Date     Time     Md  Pos  Dif  Sol Delt Rain  Volts Tmp Mot Drk UpL LwL GUp GDn CoL OvC  Knots"));
+      Serial.println(F("# Date     Time     Md  Pos  Dif  Sol Delt Rain  Volts Tmp Drk UpL LwL GUp GDn Knots"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -940,22 +891,19 @@ void print_status_to_serial_callback(void)
     {
       char supply_volts_str[8];
       dtostrf(supply_volts, 7, 3, supply_volts_str);
-      snprintf(cbuf, sizeof(cbuf), " %4d %s %3d %3d ",
+      snprintf(cbuf, sizeof(cbuf), " %4d %s %3d ",
                (int)(rain_sensor_volts * 100.0),
                supply_volts_str,
-               (int)contactor_temperature_F,
-               accumulated_motor_on_time / 1000);
+               (int)contactor_temperature_F);
     }
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %3d %3d %2d.%1d",
+    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %2d.%1d",
              dark,
              at_upper_position_limit,
              at_lower_position_limit,
              panels_going_up,
              panels_going_down,
-             motor_cooling_off,
-             motor_down_overcurrent | motor_up_overcurrent,
              (int)recent_max_wind_speed_knots,
              (int)(recent_max_wind_speed_knots * 10.0) % 10);
     Serial.println(cbuf);
@@ -1365,7 +1313,7 @@ void control_hydraulics_callback()
 {
   turn_off_motor_power_supply_if_idle();
 
-  if (panels_going_up || panels_going_down || motor_cooling_off) {
+  if (panels_going_up || panels_going_down) {
     return;
   }
 
@@ -1419,7 +1367,7 @@ void monitor_serial_console_callback(void)
           {
             tmElements_t tm;
             if (RTC.read(tm) == false) {
-              Serial.println(F("# alert RTC read failed");
+              Serial.println(F("# alert RTC read failed"));
             }
             tm.Year = host_year;
             tm.Month = host_month;
@@ -1428,7 +1376,6 @@ void monitor_serial_console_callback(void)
               Serial.print(F("# alert RTC write failed"));
             }
           }
-          date_set = true;
         }
         break; 
 
@@ -1441,7 +1388,7 @@ void monitor_serial_console_callback(void)
           {
             tmElements_t tm;
             if (RTC.read(tm) == false) {
-              Serial.println(F("# alert RTC read failed");
+              Serial.println(F("# alert RTC read failed"));
             }
             tm.Hour = host_hour;
             tm.Minute = host_minute;
@@ -1450,8 +1397,6 @@ void monitor_serial_console_callback(void)
               Serial.print(F("# alert RTC write failed"));
             }
           }
-
-          time_set = true;
         }
         break;
 
@@ -1637,24 +1582,6 @@ const char *operation_mode_string(void)
       break;
   }
 }
-
-const char *operation_mode_string(void);
-
-//  These functions are only called if set_rtc_from_build_time is defined, but we always compile it to reduce the chance that
-// it suffers bit rot.
-bool getTime(const char *str, tmElements_t *tm) 
-{
-  int Hour, Min, Sec;
-
-  if (sscanf(str, "%d:%d:%d", &Hour, &Min, &Sec) != 3) {
-    return false;
-  }
-  tm->Hour = Hour;
-  tm->Minute = Min;
-  tm->Second = Sec;
-  return true;
-}
-
 
   
 
