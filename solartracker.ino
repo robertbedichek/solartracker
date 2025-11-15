@@ -87,15 +87,6 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 */
 const unsigned long serial_baud = 115200;
 
-//   Default maximum time the motor can be on continuously.  This is just the default value for when
-//   the user resets to "factory defaults".  Units are milliseconds.
-const unsigned long motor_max_on_time_default = 90000;
-
-//  On-time hysteresis in milliseconds.  Once the motor has been running too long, past the max-motor-on-time limit,
-//  we turn off until the on-time falls below the limit minus this vale.  This avoids the system turning on and off
-//  rapidly when the limit is reached.
-const int motor_on_time_hysterisis = 20000;
-
 const int position_hysteresis = 1;
 
 const unsigned motor_current_threshold_low = 10;
@@ -155,7 +146,6 @@ const float low_wind_threshold = 6;
 const float high_wind_threshold = 12;
 
 #define BACKLIGHT_ON_TIME (3600)
-#define INITIAL_OPERATION_MODE (mode_position)
 
 /*
    These come from Arudino Analog input 1, which is driven by the center tap of two resistors that connect to the 12V line and
@@ -304,7 +294,6 @@ enum val_to_display_e { vtd_none = 0,
                         vtd_position_upper_limit,
                         vtd_position_lower_limit,
                         vtd_darkness_threshold,
-                        vtd_motor_amps_limit,
                         vtd_wind_speed_limit,
                         vtd_last
 } vtd_current = vtd_none;
@@ -1092,7 +1081,7 @@ void monitor_rain_sensor_callback()
     // If that counter gets to some value, which indicates the sensor has been dry for a while, then
     // leave rain-stow mode and go into position mode if the position sensor seems to work or time mode if it does not.
   } else if (calvals.operation_mode == rain_stow_mode) {
-    static unsigned rain_stopped_time = 0;
+    static unsigned long rain_stopped_time = 0UL;
     bool raining = is_raining();
     turn_off_rain_sensor();
     if (raining) {
@@ -1192,8 +1181,6 @@ void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback
 int panel_movement_start_hour(void)
 {
   time_t t = now();
-  int h = hour(t);
-  int minutes_of_hour = minute(t);
   int raise_hour = 8;          // Hour to start raising panels (default for winter)
 
   switch (month(t)) {
@@ -1358,7 +1345,7 @@ void monitor_serial_console_callback(void)
       Serial.println(command_buf);
 
       switch (command_buf[0]) {   
-        case 'd': // Set date command, "d year-month-day", e.g., "t 2025-05-23" to set the date
+        case 'd': // Set date command, "d year-month-day", e.g., "d 2025-05-23" to set the date
         {
           int host_year, host_month, host_day;
           sscanf(command_buf + 2, "%d-%d-%d", &host_year, &host_month, &host_day);
@@ -1369,7 +1356,7 @@ void monitor_serial_console_callback(void)
             if (RTC.read(tm) == false) {
               Serial.println(F("# alert RTC read failed"));
             }
-            tm.Year = host_year;
+            tm.Year = CalendarYrToTm(host_year);
             tm.Month = host_month;
             tm.Day = host_day;
             if (RTC.write(tm) == false) {
