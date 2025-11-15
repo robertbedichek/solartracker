@@ -66,8 +66,6 @@ Adafruit_ADS1115 ads; /* Use this for the 16-bit version */
 //    This is for the 1307 RTC
 #include <DS1307RTC.h>
 
-//   All the operational code uses this time structure.  This is initialized at start time from the battery-backed up DS1307 RTC.
-time_t arduino_time;
 bool date_set = false;
 bool time_set = false;
 
@@ -85,19 +83,9 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 #define BACKLIGHT_WHITE (7)
 
 /*
-   Set this to set the time to the build time.  This is currently the only way to set time (let this be defined, compile, and
-   run right away so that the compile-time time is pretty close to the actual time).
-*/
-const bool set_rtc_time_from_build_time = false;
-
-/*
    Speed at which we run the USB serial connection 
 */
 const unsigned long serial_baud = 115200;
-
-
-//   Number of milliseconds to wait after boot and build display before starting operational part.
-const int boot_delay_milliseconds = 2000;
 
 //   Default maximum time the motor can be on continuously.  This is just the default value for when
 //   the user resets to "factory defaults".  Units are milliseconds.
@@ -187,8 +175,6 @@ float contactor_temperature_F;  // Degrees in Farenheight of temperature sensor 
 
 float solar_volts;
 
-
-
 /*
     'dark' is when
    both sensors indicate the light level is so low that it must be nighttime.  That is our trigger to lower the panels to
@@ -225,9 +211,7 @@ bool position_sensor_failed = false;      // Set true if the position sensor val
 unsigned last_position_sensor_val;        // Position value at last call to status print
 unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
-
-
-Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND / 10, TASK_FOREVER,
+Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND / 4, TASK_FOREVER,
                                                                         &monitor_upward_moving_panels_and_stop_when_target_position_reached_callback, &ts, false);
 
 //---------------------------------------------------------------------------------------------------
@@ -373,15 +357,18 @@ void vtd_display_current(void) {
     case vtd_time:
       lcd.print(F("Date   Time   "));
       lcd.setCursor(0, 1);
-      lcd.print(monthShortStr(month(arduino_time)));
-      lcd.write(' ');
-      lcd.print(day(arduino_time));
-      lcd.write(' ');
-      lcd.print(hour(arduino_time));
-      lcd.write(':');
-      lcd.print(minute(arduino_time));
-      lcd.write(':');
-      lcd.print(second(arduino_time));
+      {
+        time_t t = now();
+        lcd.print(monthShortStr(month(t)));
+        lcd.write(' ');
+        lcd.print(day(t));
+        lcd.write(' ');
+        lcd.print(hour(t));
+        lcd.write(':');
+        lcd.print(minute(t));
+        lcd.write(':');
+        lcd.print(second(t));
+      }
 
       bytes = 15;
       break;
@@ -563,21 +550,17 @@ unsigned long time_of_last_use_of_motor_power_supply;
 
 void turn_on_motor_power_supply(void) 
 {
-  unsigned long current_second = millis() / 1000;
-
   // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
   // input.  That allows us to drive it high with a power-supply over ride switch without having that
   // conflict with the ATMega output driver.
   pinMode(MOTOR_PS_SSR_ENABLE_PIN, OUTPUT);
   digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, HIGH);
-  time_of_last_use_of_motor_power_supply = current_second;
+  time_of_last_use_of_motor_power_supply = millis();
 }
 
 void turn_off_motor_power_supply_if_idle(void) 
 {
-  unsigned long current_second = millis() / 1000;
-
-  if ((current_second - time_of_last_use_of_motor_power_supply) > 600) {
+  if ((millis() - time_of_last_use_of_motor_power_supply) > 600 * 1000UL) {
     // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
     // input.  That allows us to drive it high with a power-supply over ride switch without having that
     // conflict with the ATMega output driver.
@@ -656,6 +639,9 @@ void fail(const __FlashStringHelper *fail_message) {
   abort();
 }
 
+// Value of millis() the last time we drove the panels up
+unsigned long last_drive_panels_up_time;
+
 /*
    Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going down when this was called.
@@ -665,6 +651,7 @@ void drive_panels_up(void)
   if (panels_going_down) {
     fail(F("drive_panels_up()"));
   } else {
+    
     Serial.println(F("# lift "));
     quad_relay.turnRelayOn(RELAY_UP);
     turn_on_motor_power_supply();
@@ -716,7 +703,6 @@ void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_with
 */
 void read_time_and_sensor_inputs_callback() 
 {
-  arduino_time = now();
   const float ema_alpha = 0.5;
   float alpha;
   const int samples = 10;  // # of samples in arithmetic average
@@ -919,7 +905,7 @@ void print_status_to_serial_callback(void)
      last_at_lower_position_limit != at_lower_position_limit || 
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
-     abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
+  //   abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
      skipped_record_counter++ > 1000) {
 
     last_position_sensor_val = position_sensor_val;
@@ -941,13 +927,17 @@ void print_status_to_serial_callback(void)
 
     // We generate the output line in chunks, to conversve memory.  But it also makes the code easier to
     // read because we don't have one humongous snprintf().  The size of buf is carefully chosen to be just large enough.
-    snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
-             year(arduino_time),
-             month(arduino_time),
-             day(arduino_time),
-             hour(arduino_time),
-             minute(arduino_time),
-             second(arduino_time));
+    {
+      time_t t = now();
+
+      snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
+             year(t),
+             month(t),
+             day(t),
+             hour(t),
+             minute(t),
+             second(t));
+    }
     Serial.print(cbuf);
 
     snprintf(cbuf, sizeof(cbuf), "%d %4d %4d %4d %4d",
@@ -983,7 +973,6 @@ void print_status_to_serial_callback(void)
   }
 }
 
-
 /*
      Check to see if the system has reached its high or low limits and stop the panels from moving if so.
 */
@@ -993,6 +982,7 @@ void monitor_position_limits_callback()
     stop_driving_panels(F("failed position sensor"));
   } else {
     if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
+      last_drive_panels_up_time = millis();
       stop_driving_panels((void *)0 /* F("upper limit reached") */);
     }
     if (panels_going_down) {
@@ -1000,7 +990,7 @@ void monitor_position_limits_callback()
         stop_driving_panels((void *)0 /* F("lower limit reached") */);
       }
       if (let_panels_fall_without_power_global) {
-        if (hour(arduino_time) == 8) {
+        if (hour(now()) == 8) {
           // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
           stop_driving_panels((void *)0 /* F("letting panels fall") */);
         }
@@ -1023,12 +1013,12 @@ void monitor_position_limits_callback()
 void monitor_stall_and_motor_current_callback() 
 {
   // First check to see that the panels are moving (and thus not stalled)
-  unsigned long now = millis();
+ 
   if (panels_going_up) {
     if (position_sensor_val <= last_position_sensor_val_stall) {
       if (stall_start_time == 0) {
-        stall_start_time = now;
-      } else if ((now - stall_start_time) > 500) {
+        stall_start_time = millis();
+      } else if ((millis() - stall_start_time) > 500) {
         stop_driving_panels(F("motor stall going up"));
         daily_stalls++;
         if (daily_stalls > 2) {
@@ -1042,8 +1032,8 @@ void monitor_stall_and_motor_current_callback()
   } else if (panels_going_down) {
     if (position_sensor_val >= last_position_sensor_val_stall) {
       if (stall_start_time == 0) {
-        stall_start_time = now;
-      } else if ((now - stall_start_time) > 500) {
+        stall_start_time = millis();
+      } else if ((millis() - stall_start_time) > 500) {
         stop_driving_panels(F("motor stall going down"));
         daily_stalls++;
         if (daily_stalls > 2) {
@@ -1064,21 +1054,23 @@ void monitor_stall_and_motor_current_callback()
     char vbuf[10];
     dtostrf(supply_volts, 6, 3, vbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
-              hour(arduino_time),
-              minute(arduino_time),
-              second(arduino_time),
+    {
+      time_t t = now();
+      snprintf(cbuf, sizeof(cbuf), "# %02u:%02u:%02u position=%u amps=%d supply_volts=%s ",
+              hour(t),
+              minute(t),
+              second(t),
               (unsigned)position_sensor_val,
               amps,
               vbuf);
+    }
     
     Serial.println(cbuf);
   }
   if (amps < motor_current_threshold_low) {
-    unsigned long now = millis();
     if (under_current_start_time == 0) {
-      under_current_start_time = now;
-    } else if ((now - under_current_start_time) > 9000) {
+      under_current_start_time = millis();
+    } else if ((millis() - under_current_start_time) > 9000) {
       stop_driving_panels(F("low current for 9 seconds"));
     }
   } else {
@@ -1145,7 +1137,7 @@ int panel_movement_end_hour(void);
 
 void monitor_rain_sensor_callback() 
 {
-  int h = hour(arduino_time);
+  int h = hour(now());
   bool panel_movement_time = panel_movement_start_hour() <= h && h <= panel_movement_end_hour();
   if (panel_movement_time &&
       !panels_going_up && 
@@ -1173,12 +1165,10 @@ void monitor_rain_sensor_callback()
     if (raining) {
       rain_stopped_time = 0;     // It is still raining, keep this set to zero.
     } else {
-      unsigned long current_second = millis() / 1000UL;
-      
       if (rain_stopped_time == 0) {
-        rain_stopped_time = current_second;
+        rain_stopped_time = millis();
       } else {
-        if ((current_second - rain_stopped_time) > 7200UL) {
+        if ((millis() - rain_stopped_time) > 7200 * 1000UL) {
           Serial.println(F("# alert leaving rain-stow mode, resuming normal operation"));
           // The rain stopped two hours ago, leave rain-stow mode.
           calvals.operation_mode = position_mode;
@@ -1268,11 +1258,12 @@ void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback
 
 int panel_movement_start_hour(void)
 {
-  int h = hour(arduino_time);
-  int minutes_of_hour = minute(arduino_time);
+  time_t t = now();
+  int h = hour(t);
+  int minutes_of_hour = minute(t);
   int raise_hour = 8;          // Hour to start raising panels (default for winter)
 
-  switch (month(arduino_time)) {
+  switch (month(t)) {
     case 11:
     case 12:
     case 1:
@@ -1299,7 +1290,7 @@ int panel_movement_end_hour(void)
   // 7,000 bytes of instruction memory free, but only 310 bytes of data free.  I don't know how much of that free memory is used
   // by the stack, but I don't think I can afford to make it any smaller.  So I am using a code-intensive approach in this function.
 
-  switch (month(arduino_time)) {
+  switch (month(now())) {
     case 11:
     case 12:
     case 1:
@@ -1320,8 +1311,9 @@ int panel_movement_end_hour(void)
 
 void drive_panels_to_desired_position(void) 
 {
-  int h = hour(arduino_time);
-  int minutes_of_hour = minute(arduino_time);
+  time_t t = now();
+  int h = hour(t);
+  int minutes_of_hour = minute(t);
   int raise_hour = panel_movement_start_hour();          // Hour to start raising panels (default for winter)
   int top_position_hour = 10;  // Hour at which panels should be in top position
   int lower_hour = panel_movement_end_hour();         // Hour at which considering lowering panels, wait for dark to lower them
@@ -1330,7 +1322,7 @@ void drive_panels_to_desired_position(void)
   // 7,000 bytes of instruction memory free, but only 310 bytes of data free.  I don't know how much of that free memory is used
   // by the stack, but I don't think I can afford to make it any smaller.  So I am using a code-intensive approach in this function.
 
-  switch (month(arduino_time)) {
+  switch (month(t)) {
     case 11:
     case 12:
     case 1:
@@ -1346,7 +1338,11 @@ void drive_panels_to_desired_position(void)
       top_position_hour = 13;
       break;
   }
-  if (raise_hour <= h && h < lower_hour && daily_stalls < 5) {
+  
+  // If it is the right time of day to raise the panels, we haven't stalled too many times today, and it has
+  // been at least 30 minutes since the last time we raised the panels, then consider further raising them
+
+  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (last_drive_panels_up_time - millis()) > 30 * 60 * 1000UL) {
     monitor_rain_sensor.enable();
     int position_range = calvals.position_upper_limit - calvals.position_lower_limit;
     int minute_range = (top_position_hour - raise_hour) * 60;
@@ -1384,7 +1380,7 @@ void control_hydraulics_callback()
 {
   turn_off_motor_power_supply_if_idle();
 
-  if (panels_going_up || panels_going_down || motor_cooling_off || position_sensor_failed || millis() < 10000) {
+  if (panels_going_up || panels_going_down || motor_cooling_off || position_sensor_failed) {
     return;
   }
 
@@ -1419,6 +1415,7 @@ void monitor_serial_console_callback(void)
   static char command_buf[20];
 
   while (Serial.available() > 0) {  // Check if data is available to read
+    time_t t = now();
     char received_char = Serial.read();  // Read one character
     int l = strlen(command_buf);
     if (l >= sizeof(command_buf) - 1) {
@@ -1433,18 +1430,41 @@ void monitor_serial_console_callback(void)
       switch (command_buf[0]) {   
         case 'd': // Set date command, "d year-month-day", e.g., "t 2025-05-23" to set the date
         {
-          int year, month, day;
-          sscanf(command_buf + 2, "%d-%d-%d", &year, &month, &day);
-          setTime(hour(arduino_time), minute(arduino_time), second(arduino_time), day, month, year);
+          int host_year, host_month, host_day;
+          sscanf(command_buf + 2, "%d-%d-%d", &host_year, &host_month, &host_day);
+          setTime(hour(t), minute(t), second(t), host_day, host_month, host_year);
+          
+          {
+            tmElements_t tm;
+            RTC.read(tm);
+            tm.Year = host_year;
+            tm.Month = host_month;
+            tm.Day = host_day;
+            if (RTC.write(tm)) {
+              Serial.print(F("# alert RTC write failed"));
+            }
+          }
           date_set = true;
         }
         break; 
 
         case 't': // Set time command, "t hh:mm:ss", e.g., "t 9:23:33" to set the time.
         {
-          int hh, mmin, ss;
-          sscanf(command_buf + 2, "%d:%d:%d", &hh, &mmin, &ss);
-          setTime(hh, mmin, ss, day(arduino_time), month(arduino_time), year(arduino_time));
+          int host_hour, host_minute, host_second;
+          sscanf(command_buf + 2, "%d:%d:%d", &host_hour, &host_minute, &host_second);
+          setTime(host_hour, host_minute, host_second, day(t), month(t), year(t));
+
+          {
+            tmElements_t tm;
+            RTC.read(tm);
+            tm.Hour = host_hour;
+            tm.Minute = host_minute;
+            tm.Second = host_second;
+            if (RTC.write(tm)) {
+              Serial.print(F("# alert RTC write failed"));
+            }
+          }
+
           time_set = true;
         }
         break;
@@ -1513,7 +1533,7 @@ void monitor_cron_callback(void)
    * of this "if".  After that, in the wee hours, it will also executes.
    * The body copies the RTC to 'arduino_time' and it set up the cron string for the day
   */
-  if (hour(arduino_time) < 6) {
+  if (hour(now()) < 6) {
     set_arduino_time_from_rtc();
   }
 }
@@ -1589,12 +1609,7 @@ void setup()
   Serial.begin(serial_baud);
   UCSR0A = UCSR0A | (1 << TXC0);  //Clear Transmit Complete Flag
 
-  if (set_rtc_time_from_build_time) {
-    set_rtc_from_build_date_and_time();
-  }
-  if (!date_set && !time_set) {
-    set_arduino_time_from_rtc();
-  }
+  set_arduino_time_from_rtc();
 
   Serial.print(F("\n\r# reboot SolarTracker "));
   Serial.print(F(__DATE__));
@@ -1667,89 +1682,6 @@ bool getTime(const char *str, tmElements_t *tm)
   return true;
 }
 
-bool getDate(const char *str, tmElements_t *tm) 
-{
-  char Month[12];
-  int Day, Year;
-  uint8_t monthIndex;
-  const char *monthName[12] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-  };
 
-  if (sscanf(str, "%s %d %d", Month, &Day, &Year) != 3) return false;
-  for (monthIndex = 0; monthIndex < 12; monthIndex++) {
-    if (strcmp(Month, monthName[monthIndex]) == 0) break;
-  }
-  if (monthIndex >= 12) return false;
-  tm->Day = Day;
-  tm->Month = monthIndex + 1;
-  tm->Year = CalendarYrToTm(Year);
-  return true;
-}
+  
 
-void set_rtc_from_build_date_and_time() 
-{
-  tmElements_t tm;
-
-  bool parse = false;
-  bool config = false;
-
-  // get the date and time the compiler was run
-  if (getDate(__DATE__, &tm) && getTime(__TIME__, &tm)) {
-    parse = true;
-
-    // The value we store into the RTC is the non-daylight-savings-time value
-    if (dst_correction(&tm)) {
-      if (tm.Hour == 0) {
-        fail(F("set_rtc_from_build_date_and_time()"));
-      }
-      tm.Hour--;
-      tm.Second += 10;  // Empirical: difference between build time and time to run this code
-      if (tm.Second > 59) {
-        tm.Second -= 60;
-        tm.Minute++;
-        if (tm.Minute > 59) {
-          tm.Minute -= 60;
-          tm.Hour++;
-          if (tm.Hour > 23) {
-            tm.Hour -= 24;
-            tm.Day++;
-          }
-        }
-      }
-    }
-
-    // and configure the RTC with this info
-    snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
-             tmYearToCalendar(tm.Year),
-             tm.Month,
-             tm.Day,
-             tm.Hour,
-             tm.Minute,
-             tm.Second);
-
-
-    if (RTC.write(tm)) {
-      if (RTC.read(tm)) {
-        snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
-                 tmYearToCalendar(tm.Year),
-                 tm.Month,
-                 tm.Day,
-                 tm.Hour,
-                 tm.Minute,
-                 tm.Second);
-        config = true;
-      }
-    }
-  }
-
-  if (parse && config) {
-      // Normal path
-  } else if (parse) {
-    fail(F("# alert DS1307"));
-
-  } else {
-    fail(F("# alert time string"));
-  }
-}
