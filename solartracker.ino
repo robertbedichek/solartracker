@@ -66,9 +66,6 @@ Adafruit_ADS1115 ads; /* Use this for the 16-bit version */
 //    This is for the 1307 RTC
 #include <DS1307RTC.h>
 
-bool date_set = false;
-bool time_set = false;
-
 //   If we are able to read the DS1307 RTC over I2C, then we set this true and we can depend on
 //  the time of day being valid.
 bool time_of_day_valid = false;
@@ -644,7 +641,6 @@ void read_time_and_sensor_inputs_callback()
   float position_sensor_val_temp = 0;
   float contactor_temperature_F_temp = 0;
   float wind_speed_knots_temp = 0;
-  float rain_sensor_volts_temp = 0;
   float solar_volts_temp = 0;
   static bool first_time = true;
 
@@ -1023,7 +1019,7 @@ bool is_raining(void)
     delay(100); // Hopefully the relay will close in less than 100 milliseconds
   }
 
-  // Take ar number of samples to get a better estimate of actual voltage.
+  // Take a number of samples to get a better estimate of actual voltage.
   unsigned long rain_sensor_raw = 0;
   const int samples = 10;
   for (int i = 0 ; i < samples ; i++) {
@@ -1386,18 +1382,6 @@ void monitor_serial_console_callback(void)
           }
         }
         break;
-
-        case 's':
-//          select_key_pressed = true;
-          break;
-
-        case '+':
-  //        plus_key_pressed = true;
-          break;
-
-        case '-':
-    //      minus_key_pressed = true;
-          break;
 
         case 'w':
           wind_stow_disabled = !wind_stow_disabled;
