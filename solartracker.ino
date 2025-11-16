@@ -35,8 +35,7 @@ char cbuf[55];
 const bool let_panels_fall_without_power_global = true;
 const unsigned long max_solenoid_on_time = 1800 * 1000UL;
 const unsigned long max_solenoid_off_time = 2700 * 1000UL;
-unsigned long solenoid_power_supply_on_time;  // Value of millis() when we last turned on the solenoid, 0 when off
-unsigned long solenoid_power_supply_off_time; // Value of millis() when we last turned off thesolenoid, 0 when on
+unsigned long solenoid_power_supply_on_off_time;  // Value of millis() when we last turned on the solenoid on or off
 
 
 // The following is for the Sparkfun 4-relay board.  Relay numbers are 1..4.  Relay 1 is for "up", 3 is for "down".
@@ -84,7 +83,11 @@ Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
 */
 const unsigned long serial_baud = 115200;
 
-const int position_hysteresis = 1;
+const int position_hysteresis = 5;
+/*
+ * This global variable is set to the position value to which we are trying to raise the panels.
+ */
+int desired_position = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 100;
@@ -182,7 +185,6 @@ Task monitor_lcd_backlight(TASK_SECOND, TASK_FOREVER, &monitor_lcd_backlight_cal
 void monitor_cron_callback();
 Task monitor_cron(TASK_SECOND * 3600 * 4, TASK_FOREVER, &monitor_cron_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
-void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback();
 
 //   Calculated from 'position_sensor_val' and the position limit calibration values.
 bool at_upper_position_limit = false, at_lower_position_limit = false;
@@ -193,9 +195,6 @@ float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
 unsigned last_position_sensor_val;        // Position value at last call to status print
 unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
-Task monitor_upward_moving_panels_and_stop_when_target_position_reached(TASK_SECOND / 4, TASK_FOREVER,
-                                                                        &monitor_upward_moving_panels_and_stop_when_target_position_reached_callback, &ts, false);
-
 //---------------------------------------------------------------------------------------------------
 void monitor_rain_sensor_callback();
 float rain_sensor_volts;
@@ -204,7 +203,7 @@ bool rain_stow_disable = false;
 Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 void monitor_wind_sensor_callback();
-bool wind_stow_disabled = true;
+bool wind_stow_disabled = false;
 float wind_speed_knots = 0.0;             // In knots
 float recent_max_wind_speed_knots = 0.0;  // Maximum recorded value since we started
 
@@ -493,37 +492,43 @@ void turn_on_motor_power_supply(void)
 void turn_off_motor_power_supply_if_idle(void) 
 {
   if ((millis() - time_of_last_use_of_motor_power_supply) > 600 * 1000UL) {
-    // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
-    // input.  That allows us to drive it high with a power-supply over ride switch without having that
-    // conflict with the ATMega output driver.
-    pinMode(MOTOR_PS_SSR_ENABLE_PIN, INPUT);
-    digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, LOW);  // We write the bit with a zero ust so we can query later to see the state 
+    turn_off_motor_power_supply();
   }
 }
 
-
+void turn_off_motor_power_supply(void)
+{
+  // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
+  // input.  That allows us to drive it high with a power-supply over ride switch without having that
+  // conflict with the ATMega output driver.
+  pinMode(MOTOR_PS_SSR_ENABLE_PIN, INPUT);
+  digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, LOW);  // We write the bit with a zero ust so we can query later to see the state 
+}
 void turn_on_solenoid_power_supply(void) 
 {
-  if (digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == LOW) {
+  if (solenoid_power_supply_is_on() == false) {
     pinMode(SOLENOID_PS_SSR_ENABLE_PIN, OUTPUT);
     digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, HIGH);
     delay(2000);  // Wait for supply to develop powers
   }
-  solenoid_power_supply_on_time = millis();
-  solenoid_power_supply_off_time = 0;
+  solenoid_power_supply_on_off_time = millis();
 }
 
 void turn_off_solenoid_power_supply(void) 
 {
-  if (digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == HIGH) {
+  if (solenoid_power_supply_is_on()) {
     // Instead of driving the output low, we turn it off by telling the Arudino runtime that it is an
     // input.  That allows us to drive it high with a power-supply over ride switch without having that
     // conflict with the ATMega output driver.
     pinMode(SOLENOID_PS_SSR_ENABLE_PIN, INPUT);
     digitalWrite(SOLENOID_PS_SSR_ENABLE_PIN, LOW);  // Just so we can query later
-    solenoid_power_supply_on_time = 0;
-    solenoid_power_supply_off_time = millis();
+    solenoid_power_supply_on_off_time = millis();
   }
+}
+
+bool solenoid_power_supply_is_on(void)
+{
+  return digitalRead(SOLENOID_PS_SSR_ENABLE_PIN) == HIGH;
 }
 
 /*
@@ -547,7 +552,6 @@ void stop_driving_panels(const __FlashStringHelper *who_called)
    */
   monitor_position_limits.disable();
   monitor_stall_and_motor_current.disable();
-  monitor_upward_moving_panels_and_stop_when_target_position_reached.disable();
   lcd.setCursor(0, 1);
   lcd.print(F("Stopped "));
   lcd.print((int)position_sensor_val);
@@ -814,6 +818,7 @@ void print_status_to_serial_callback(void)
   static bool last_at_lower_position_limit;
   static bool last_panels_going_up;
   static bool last_panels_going_down;
+  static bool last_solenoid_power_supply_is_on;
   static unsigned skipped_record_counter;
   static float last_recent_max_wind_speed_knots;
 
@@ -821,7 +826,7 @@ void print_status_to_serial_callback(void)
   if (last_position_sensor_val == 0) {
     last_position_sensor_val = position_sensor_val;
   }
-  position_difference = last_position_sensor_val - (int)position_sensor_val;
+  position_difference = position_sensor_val - last_position_sensor_val;
 
   if (abs(position_difference) > 5 || 
      last_operation_mode != calvals.operation_mode || 
@@ -830,7 +835,8 @@ void print_status_to_serial_callback(void)
      last_at_lower_position_limit != at_lower_position_limit || 
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
-  //   abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
+     last_solenoid_power_supply_is_on != solenoid_power_supply_is_on() ||
+     abs(recent_max_wind_speed_knots - last_recent_max_wind_speed_knots) > 1 || 
      skipped_record_counter++ > 1000) {
 
     last_position_sensor_val = position_sensor_val;
@@ -840,11 +846,12 @@ void print_status_to_serial_callback(void)
     last_at_lower_position_limit = at_lower_position_limit;
     last_panels_going_up = panels_going_up;
     last_panels_going_down = panels_going_down;
+    last_solenoid_power_supply_is_on = solenoid_power_supply_is_on();
     last_recent_max_wind_speed_knots = recent_max_wind_speed_knots;
     skipped_record_counter = 0;
 
     if (line_counter == 0) {
-      Serial.println(F("# Date     Time     Md  Pos  Dif  Sol Delt Rain  Volts Tmp Drk UpL LwL GUp GDn Knots"));
+      Serial.println(F("# Date     Time     Md  Pos  Dif  Sun Delt Rain  Volts Tmp Drk UpL LwL GUp GDn Sol Knots"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -883,12 +890,13 @@ void print_status_to_serial_callback(void)
     }
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %2d.%1d",
+    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %3d %2d.%1d",
              dark,
              at_upper_position_limit,
              at_lower_position_limit,
              panels_going_up,
              panels_going_down,
+             solenoid_power_supply_is_on(),
              (int)recent_max_wind_speed_knots,
              (int)(recent_max_wind_speed_knots * 10.0) % 10);
     Serial.println(cbuf);
@@ -914,10 +922,9 @@ void monitor_position_limits_callback()
         stop_driving_panels((void *)0 /* F("letting panels fall") */);
       }
       // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
-      if (solenoid_power_supply_on_time != 0 && (millis() - solenoid_power_supply_on_time) > max_solenoid_on_time) {
+      if (solenoid_power_supply_is_on() && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_on_time) {
         turn_off_solenoid_power_supply();
-      }
-      if (solenoid_power_supply_off_time != 0 && (millis() - solenoid_power_supply_off_time) > max_solenoid_off_time) {
+      } else if (solenoid_power_supply_is_on() == false && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_off_time) {
         turn_on_solenoid_power_supply();
       }
     }
@@ -1152,21 +1159,6 @@ void monitor_wind_sensor_callback()
 }
 
 /*
- * This global variable is set to the position value to which we are trying to raise the panels.
- */
-int desired_position = 0;
-
-void monitor_upward_moving_panels_and_stop_when_target_position_reached_callback() 
-{
-  if (panels_going_up == false) {
-    fail(F("MP"));
-  }
-  if (position_sensor_val >= desired_position) {
-    stop_driving_panels((void *)0 /* position limit reached */);
-  }
-}
-
-/*
    Check to see if the sun angle sensor is showing that the sun has move to be higher in the sky and so the suns rays are no
    longer normal to the panels (and sensor).  In this case, start raising the panels.
 
@@ -1276,7 +1268,6 @@ void drive_panels_to_desired_position(void)
       monitor_rain_sensor.enable();
       if (is_raining() == false) {
         drive_panels_up();
-        monitor_upward_moving_panels_and_stop_when_target_position_reached.enable();
       }
     }
   } else if (lower_hour <= h && dark) {
@@ -1494,6 +1485,8 @@ void setup()
     fail(F("REL"));
   }
   quad_relay.turnAllRelaysOff();
+  turn_off_solenoid_power_supply();
+  turn_off_motor_power_supply();
 
   Serial.begin(serial_baud);
   UCSR0A = UCSR0A | (1 << TXC0);  //Clear Transmit Complete Flag
