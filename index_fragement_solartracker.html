@@ -1,0 +1,104 @@
+  <script>
+window.addEventListener('load', () => {
+  fetch('solartracker.txt')
+    .then(response => response.text())
+    .then(rawData => {
+//      console.log('Raw data loaded:', rawData.substring(0, 200)); // First 200 chars
+
+      const lines = rawData.trim().split('\n');
+//      console.log('Number of lines:', lines.length);
+
+      const headerLine = lines.find(line => line.startsWith('#') && line.includes('Date'));
+//      console.log('Header line:', headerLine);
+
+      const header = headerLine.replace(/^#\s*/, '').split(/\s+/);
+//      console.log('Parsed header:', header);
+//      console.log('Header length:', header.length);
+
+      const dataLines = lines.filter(line => !line.startsWith('#') && line.trim().length > 0);
+//      console.log('Number of data lines:', dataLines.length);
+//      console.log('First data line:', dataLines[0]);
+
+      const data = dataLines.map(line => line.trim().split(/\s+/));
+//      console.log('First parsed data row:', data[0]);
+//      console.log('First row length:', data[0].length);
+
+      const colIndex = name => header.indexOf(name);
+
+//      console.log('Column indices - Date:', colIndex("Date"), 'Time:', colIndex("Time"),
+//                  'Pos:', colIndex("Pos"), 'Tmp:', colIndex("Tmp"));
+
+      const timestamps = data.map(row => new Date(`${row[colIndex("Date")]}T${row[colIndex("Time")]}`));
+//      console.log('Timestamps:', timestamps);
+
+      const position = data.map(row => parseFloat(row[colIndex("Pos")]));
+//      console.log('Position values:', position);
+
+      const temperature = data.map(row => parseFloat(row[colIndex("Tmp")]));
+//      console.log('Temperature values:', temperature);
+
+      const knots = data.map(row => parseFloat(row[colIndex("Knots")]));
+
+      const lowerLimit = data.map(row => parseInt(row[colIndex("LwL")]));
+      const upperLimit = data.map(row => parseInt(row[colIndex("UpL")]));
+      const solenoid = data.map(row => parseInt(row[colIndex("Sol")]));
+
+      const traces = [
+        {
+          x: timestamps,
+          y: position,
+          name: 'Position',
+          mode: 'lines+markers',
+          type: 'scatter',
+          line: { color: 'green', width: 2 },
+          marker: { size: 3 }
+        },
+        {
+          x: timestamps,
+          y: temperature,
+          name: 'Temperature (F)',
+          mode: 'lines+markers',
+          type: 'scatter',
+          line: { color: 'gray', width: 2 },
+          marker: { size: 3 }
+        },
+        {
+          x: timestamps,
+          y: lowerLimit.map(v => v ? 400 : null),
+          name: 'Panels at Lower Limit',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'black', size: 3 }
+        },
+        {
+          x: timestamps,
+          y: upperLimit.map(v => v ? 410 : null),
+          name: 'Panels at Upper Limit',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'blue', size: 3 }
+        },
+        {
+          x: timestamps,
+          y: solenoid.map(v => v ? 420 : null),
+          name: 'Solenoid On',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'red', size: 3 }
+        }
+      ];
+
+      const layout = {
+        title: 'Solar Tracker - Position, Temp & Wind',
+        xaxis: { title: 'Time' },
+        yaxis: { title: 'Value' }
+      };
+
+      Plotly.newPlot('solar_tracker_chart', traces, layout);
+    })
+    .catch(err => {
+      console.error('Failed to load data:', err);
+      document.getElementById('solar_tracker_chart').innerText = 'Error loading solartracker.txt';
+    });
+});
+</script>
