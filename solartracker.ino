@@ -203,7 +203,7 @@ bool rain_stow_disable = false;
 Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 void monitor_wind_sensor_callback();
-bool wind_stow_disabled = false;
+bool wind_stow_disabled = true;
 float wind_speed_knots = 0.0;             // In knots
 float recent_max_wind_speed_knots = 0.0;  // Maximum recorded value since we started
 
@@ -851,7 +851,7 @@ void print_status_to_serial_callback(void)
     skipped_record_counter = 0;
 
     if (line_counter == 0) {
-      Serial.println(F("# Date     Time     Md  Pos  Dif  Sun Delt Rain  Volts Tmp Drk UpL LwL GUp GDn Sol Knots"));
+      Serial.println(F("# Date     Time     Md  Pos  Dif  Sun Delt Wet   Volts Tmp Drk UpL Dnl GUp GDn Sol Rai Wnd Knots"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -890,15 +890,21 @@ void print_status_to_serial_callback(void)
     }
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %3d %2d.%1d",
+    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d %3d %3d ",
              dark,
              at_upper_position_limit,
              at_lower_position_limit,
              panels_going_up,
              panels_going_down,
-             solenoid_power_supply_is_on(),
-             (int)recent_max_wind_speed_knots,
-             (int)(recent_max_wind_speed_knots * 10.0) % 10);
+             solenoid_power_supply_is_on());
+             
+    Serial.print(cbuf);
+
+    snprintf(cbuf, sizeof(cbuf), "%3d %3d %2d.%1d",
+            calvals.operation_mode == rain_stow_mode,
+            calvals.operation_mode == wind_stow_mode,
+            (int)recent_max_wind_speed_knots,
+            (int)(recent_max_wind_speed_knots * 10.0) % 10);
     Serial.println(cbuf);
   }
 }
