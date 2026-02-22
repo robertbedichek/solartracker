@@ -55,8 +55,8 @@ unsigned long solenoid_power_supply_on_off_time;  // Value of millis() when we l
 Qwiic_Relay quad_relay(RELAY_ADDR);
 
 // Relay numbers for moving the panels up and down.
-#define RELAY_UP          (1)
-#define RELAY_DOWN        (3)
+// #define RELAY_UP          (1)
+// #define RELAY_DOWN        (3)
 #define RELAY_RAIN_SENSOR (4)
 
 #include <Adafruit_ADS1X15.h>
@@ -117,7 +117,7 @@ enum mode_e { no_panel_movement_mode,
 //   It is connected to a TMP36 temperature sensor (https://learn.adafruit.com/tmp36-temperature-sensor)
 #define TMP36_IN (2)
 
-// And for the output of a current sensor on the 4V line we use Arduino analog 3
+// This taps a shunt resistor on the ground side of the high-current motor power, 75mV per 10 amps
 #define CURRENT_SENSE_IN (3)
 
 void set_arduino_time_from_rtc(void);
@@ -251,7 +251,7 @@ void set_calvals_to_defaults() {
   calvals.position_upper_limit = 340;  // Max position value (i.e., fully tilted up) minus overshoot (real max is around 363)
   calvals.position_lower_limit = 70;
   calvals.darkness_threshold = .5;
-  calvals.operation_mode = position_mode;  // Mode in which we should start operation
+  calvals.operation_mode = no_panel_movement_mode;  // Mode in which we should start operation
 }
 
 /*
@@ -489,12 +489,12 @@ void turn_on_motor_power_supply(void)
   time_of_last_use_of_motor_power_supply = millis();
 }
 
-void turn_off_motor_power_supply_if_idle(void) 
-{
-  if ((millis() - time_of_last_use_of_motor_power_supply) > 600 * 1000UL) {
-    turn_off_motor_power_supply();
-  }
-}
+// void turn_off_motor_power_supply_if_idle(void) 
+// {
+//  if ((millis() - time_of_last_use_of_motor_power_supply) > 600 * 1000UL) {
+// turn_off_motor_power_supply();
+//  }
+// }
 
 void turn_off_motor_power_supply(void)
 {
@@ -537,13 +537,15 @@ bool solenoid_power_supply_is_on(void)
 */
 void stop_driving_panels(const __FlashStringHelper *who_called) 
 {
+  turn_off_motor_power_supply();
+
   if (who_called != (void *)0) {
     Serial.print(F("# stop_driving_panels(): "));
     Serial.println(who_called);
   }
 
-  quad_relay.turnRelayOff(RELAY_UP);
-  quad_relay.turnRelayOff(RELAY_DOWN);
+//  quad_relay.turnRelayOff(RELAY_UP);
+//  quad_relay.turnRelayOff(RELAY_DOWN);
   panels_going_down = false;
   panels_going_up = false;
 
@@ -588,7 +590,7 @@ void drive_panels_up(void)
   } else {
     
     Serial.println(F("# lift "));
-    quad_relay.turnRelayOn(RELAY_UP);
+//    quad_relay.turnRelayOn(RELAY_UP);
     turn_on_motor_power_supply();
     lcd.setCursor(0, 1);
     lcd.print(F("Going up "));
@@ -620,9 +622,9 @@ void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_with
     lcd.print(F("Going down "));
     vtd_timeout = 10;
     if (let_panels_fall_without_power == false) {
-      quad_relay.turnRelayOn(RELAY_DOWN);
-      turn_on_motor_power_supply();
-      monitor_stall_and_motor_current.enable();
+//      quad_relay.turnRelayOn(RELAY_DOWN);
+//      turn_on_motor_power_supply();
+//      monitor_stall_and_motor_current.enable();
     }
     
     panels_going_down = true;
@@ -740,16 +742,16 @@ int motor_amps(void)
     Serial.print(F("# current sense raw="));
     Serial.println(motor_current_sense_volts_raw);
   }
-  /* Empirical calibration: the raw value seems to never be less than four, even with no current */
-  if (motor_current_sense_volts_raw >= 4) {
-    motor_current_sense_volts_raw -= 4;
-  }
+  // /* Empirical calibration: the raw value seems to never be less than four, even with no current */
+//   if (motor_current_sense_volts_raw >= 4) {
+//    motor_current_sense_volts_raw -= 4;
+//  }
   float motor_current_sense_millivolts = motor_current_sense_volts_raw * 5000.0 / 1023.0;
   if (verbose) {
     Serial.print(F("# current sense millivolts="));
     Serial.println((int)motor_current_sense_millivolts);
   }
-  return (int)(motor_current_sense_millivolts / 50.0); // 50 mV/A is what I measured
+  return (int)(motor_current_sense_millivolts / 7.5); // Shunt resistor is 75 mV per 10 amps
 }
 
 void display_status_on_lcd_callback() 
@@ -1291,7 +1293,7 @@ void drive_panels_to_desired_position(void)
 
 void control_hydraulics_callback() 
 {
-  turn_off_motor_power_supply_if_idle();
+//  turn_off_motor_power_supply_if_idle();
 
   if (panels_going_up || panels_going_down) {
     return;
@@ -1445,7 +1447,9 @@ void set_arduino_time_from_rtc(void)
 {
   tmElements_t tm;
 
+  Serial.println(F("# set_arduino_time_from_rtc()"));
   if (RTC.read(tm)) {
+    Serial.println(F("# set_arduino_time_from_rtc() -- read succeeded"));
     snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
              tmYearToCalendar(tm.Year),
              tm.Month,
@@ -1474,35 +1478,39 @@ void set_arduino_time_from_rtc(void)
 */
 void setup() 
 {
-  delay(1000);  // In case something further along crashes and we restart quickly, this will give a one-second pause
   analogReference(DEFAULT);
-
-  // Set the working calibration values to the defaults that are in this file
-  set_calvals_to_defaults();
-
-  Wire.begin();
-
-  lcd.begin(16, 2);
-  lcd.print(F("reboot SolarTracker"));
-  lcd.setCursor(0, 1);
-  lcd.print(__DATE__);
-
-  if (!quad_relay.begin()) {
-    fail(F("REL"));
-  }
-  quad_relay.turnAllRelaysOff();
-  turn_off_solenoid_power_supply();
-  turn_off_motor_power_supply();
 
   Serial.begin(serial_baud);
   UCSR0A = UCSR0A | (1 << TXC0);  //Clear Transmit Complete Flag
-
-  set_arduino_time_from_rtc();
-
+  
   Serial.print(F("\n\r# reboot SolarTracker "));
   Serial.print(F(__DATE__));
   Serial.write(' ');
   Serial.println(F(__TIME__));
+ 
+  Wire.begin();
+  set_arduino_time_from_rtc();
+
+  Serial.println(F("# Time set"));
+
+ // Set the working calibration values to the defaults that are in this file
+  set_calvals_to_defaults();
+
+  
+  Serial.println(F("# Start of LCD init"));
+//  lcd.begin(16, 2);
+//  lcd.println(F("reboot SolarTracker"));
+//  lcd.setCursor(0, 1);
+//  lcd.print(__DATE__);
+  
+  Serial.println(F("# LCD init done"));
+  if (!quad_relay.begin()) {
+    fail(F("REL"));
+  }
+  Serial.println(F("# Relay init done"));
+  quad_relay.turnAllRelaysOff();
+  turn_off_solenoid_power_supply();
+  turn_off_motor_power_supply();
 
   backlight_timer = BACKLIGHT_ON_TIME;
 
@@ -1517,6 +1525,7 @@ void setup()
      s that we can set today's cron string.  We need to do that before running in time_mode.
   */
   read_time_and_sensor_inputs_callback();
+  Serial.println(F("# Init done"));
 }
 
 /*
