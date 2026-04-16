@@ -45,27 +45,28 @@ const int position_hysteresis = 5;
 int desired_position = 0;
 
 const unsigned motor_current_threshold_low = 10;
-const unsigned motor_current_threshold_high = 100;
+const unsigned motor_current_threshold_high = 90;
 bool panels_retracted;
 
 //   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
 //   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
 enum mode_e { no_panel_movement_mode,
               position_mode,
-              rain_stow_mode,
               last_mode };
 
-#define MOTOR_PS_SSR_ENABLE_PIN (7)  // Arduino output pin 7 on J4, writing '1' turns on 9V/100A power supply
+#define MOTOR_PS_SSR_ENABLE_PIN (8)  // Arduino output pin 8 on J4, writing '1' turns on 9V/100A power supply
 
-#define SOLENOID_PS_SSR_ENABLE_PIN (8)
+#define SOLENOID_PS_SSR_ENABLE_PIN (7)
 
 //    Arudino Analog In 0, measures the voltage from the draw-string position sensor
 #define DRAW_STRING_IN (0)
 
 // This taps a shunt resistor on the ground side of the high-current motor power, 75mV per 10 amps
-#define CURRENT_SENSE_IN (1)
+#define MOTOR_CURRENT_SENSE_IN (1)
 
-#define RAIN_SENSE_IN (2)
+// This measures the voltage coming from a Hall Effect sensor that is clamped to the DC cable of one
+// of the solar panels
+#define PV_CURRENT_SENSE_IN (2)
 
 const char *operation_mode_string(void);
 
@@ -91,15 +92,12 @@ bool at_upper_position_limit = false, at_lower_position_limit = false;
    This is from the 1000mm pull-string sensor that tells us where the panels are.
 */
 float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
+float pv_current_sensor_val;              // Raw ADS values of PV current clamp sensor values
+float pv_current;                    // Amps flowing past Hall Effect current sensor
+
 unsigned last_position_sensor_val;        // Position value at last call to status print
 unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
-//---------------------------------------------------------------------------------------------------
-void monitor_rain_sensor_callback();
-float rain_sensor_volts;
-
-bool rain_stow_disable = false;                                                                        
-Task monitor_rain_sensor(TASK_SECOND * 60, TASK_FOREVER, &monitor_rain_sensor_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 
 void read_time_and_sensor_inputs_callback();
@@ -140,9 +138,9 @@ bool panels_going_down = false;
    Set the calibration values to their "factory default".
 */
 void set_calvals_to_defaults() {
-  calvals.position_upper_limit = 750;  // Max position value (i.e., fully tilted up) minus overshoot (real max is around 363)
+  calvals.position_upper_limit = 320;  // Max position value (i.e., fully tilted up) minus overshoot (real max is around 363)
   calvals.position_lower_limit = 70;
-  calvals.operation_mode = no_panel_movement_mode;  // Mode in which we should start operation
+  calvals.operation_mode = position_mode;  // Mode in which we should start operation
 }
 
 
@@ -244,6 +242,7 @@ void drive_panels_up(void)
     stall_start_time = 0;
     under_current_start_time = 0;
     panels_retracted = false;
+    last_position_sensor_val_stall = position_sensor_val;
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -277,12 +276,13 @@ void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_with
 */
 void read_time_and_sensor_inputs_callback() 
 {
-  const float ema_alpha = 0.5;
+  const float ema_alpha = 0.1;
   float alpha;
   const int samples = 10;  // # of samples in arithmetic average
 
-  float position_sensor_val_temp = 0;
-  float solar_volts_temp = 0;
+  float position_sensor_val_temp = 0.0;
+  float pv_current_sensor_val_temp = 0.0;
+
   static bool first_time = true;
 
   if (first_time) {
@@ -303,10 +303,32 @@ void read_time_and_sensor_inputs_callback()
 
     unsigned position_sensor_raw = (unsigned)analogRead(DRAW_STRING_IN);
     position_sensor_val_temp += position_sensor_raw;
+
+    unsigned pv_current_sensor_raw = (unsigned)analogRead(PV_CURRENT_SENSE_IN);
+    pv_current_sensor_val_temp += pv_current_sensor_raw;
   }
 
   position_sensor_val_temp /= samples;
   position_sensor_val = alpha * position_sensor_val_temp + (1 - alpha) * position_sensor_val;
+
+  pv_current_sensor_val_temp /= samples;
+  pv_current_sensor_val = alpha * pv_current_sensor_val_temp + (1 - alpha) * pv_current_sensor_val;
+
+  float pv_current_sensor_millivolts = (pv_current_sensor_val * 5000.0) / 1023.0;
+  pv_current = (2476.4 - pv_current_sensor_millivolts) / 100.0;
+
+  if (pv_current < 0) {
+    pv_current = 0;
+  }
+  static bool verbose = false;
+  if (verbose) {
+    static int prints = 0;
+    if (prints++ < 10){
+      Serial.print(pv_current_sensor_val_temp); Serial.print(F(" "));
+      Serial.print(pv_current_sensor_val); Serial.print(F(" "));
+      Serial.println(pv_current_sensor_millivolts);
+    }
+  }
 
   at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
   at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;  // Panels are at a good lower position when position_sensor_val is 50
@@ -314,10 +336,10 @@ void read_time_and_sensor_inputs_callback()
 
 int motor_amps(void) 
 {
-  unsigned motor_current_sense_volts_raw = analogRead(/* Arduino analog input 1 */ CURRENT_SENSE_IN);
+  unsigned motor_current_sense_volts_raw = analogRead(/* Arduino analog input 1 */ MOTOR_CURRENT_SENSE_IN);
   const bool verbose = false;
 
-  if (verbose) {
+  if (verbose && motor_current_sense_volts_raw > 0) {
     Serial.print(F("# current sense raw="));
     Serial.println(motor_current_sense_volts_raw);
   }
@@ -326,7 +348,7 @@ int motor_amps(void)
 //    motor_current_sense_volts_raw -= 4;
 //  }
   float motor_current_sense_millivolts = motor_current_sense_volts_raw * 5000.0 / 1023.0;
-  if (verbose) {
+  if (verbose && motor_current_sense_volts_raw > 0) {
     Serial.print(F("# current sense millivolts="));
     Serial.println((int)motor_current_sense_millivolts);
   }
@@ -353,9 +375,9 @@ void print_status_to_serial_callback(void)
   static bool last_panels_going_up;
   static bool last_panels_going_down;
   static int last_motor_amps;
+  static float last_pv_current;
   static unsigned skipped_record_counter;
   
-
   int position_difference;  // Amount position changed since last call to status print
   if (last_position_sensor_val == 0) {
     last_position_sensor_val = position_sensor_val;
@@ -370,9 +392,10 @@ void print_status_to_serial_callback(void)
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
      last_motor_amps != (int)motor_amps() ||
+     (int)last_pv_current != (int)pv_current ||
     //  last_solenoid_power_supply_is_on != solenoid_power_supply_is_on() ||
      
-     skipped_record_counter++ > 10) {
+     skipped_record_counter++ > 1000) {
 
     last_position_sensor_val = position_sensor_val;
     last_operation_mode = calvals.operation_mode;
@@ -382,10 +405,11 @@ void print_status_to_serial_callback(void)
     last_panels_going_up = panels_going_up;
     last_panels_going_down = panels_going_down;
     last_motor_amps = (int)motor_amps();
+    last_pv_current = pv_current;
     skipped_record_counter = 0;
 
     if (line_counter == 0) {
-      Serial.println(F("# Date     Time     Md Pos  Amps Wet  UpL Dnl GUp GDn Rai"));
+      Serial.println(F("# Date     Time     Md Pos  Amps UpL Dnl GUp GDn PV Amps"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -395,7 +419,6 @@ void print_status_to_serial_callback(void)
     // read because we don't have one humongous snprintf().  The size of buf is carefully chosen to be just large enough.
     {
       time_t t = now();
-
       snprintf(cbuf, sizeof(cbuf), "%4u-%02u-%02u %02u:%02u:%02u ",
              year(t),
              month(t),
@@ -410,27 +433,17 @@ void print_status_to_serial_callback(void)
              calvals.operation_mode,
              (int)position_sensor_val,
              (int)motor_amps());
-
-    Serial.print(cbuf);
-    {
-      
-      snprintf(cbuf, sizeof(cbuf), " %4d ",
-               (int)(rain_sensor_volts * 100.0));
-
-    }
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "%3d %3d %3d %3d ",
+    snprintf(cbuf, sizeof(cbuf), " %3d %3d %3d %3d ",
              at_upper_position_limit,
              at_lower_position_limit,
              panels_going_up,
              panels_going_down);
-             
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), "%3d",
-            calvals.operation_mode == rain_stow_mode);
-            
+    dtostrf(pv_current, 4, 1, cbuf); 
+
     Serial.println(cbuf);
   }
 }
@@ -485,21 +498,6 @@ void monitor_stall_and_motor_current_callback()
     } else {
       stall_start_time = 0; // Panels are moving up, reset the time of last stall start
     }
-  } else if (panels_going_down) {
-    if (position_sensor_val >= last_position_sensor_val_stall) {
-      if (stall_start_time == 0) {
-        stall_start_time = millis();
-      } else if ((millis() - stall_start_time) > 500) {
-        stop_driving_panels(F("motor stall going down"));
-        daily_stalls++;
-        if (daily_stalls > 2) {
-          calvals.position_lower_limit += 5;
-          Serial.println(F("# alert increasing lower limit due to stall going down more than 2 times"));
-        }
-      }
-    } else {
-      stall_start_time = 0; // Panels are moving down, reset the time of last stall start
-    }
   } else {
     fail(F("stall yet panels not in motion"));
   }
@@ -524,6 +522,8 @@ void monitor_stall_and_motor_current_callback()
       under_current_start_time = millis();
     } else if ((millis() - under_current_start_time) > 9000) {
       stop_driving_panels(F("low current for 9 seconds"));
+      daily_stalls++;
+      Serial.println(daily_stalls);
     }
   } else {
     under_current_start_time = 0; // Not taking too little, reset the start time of undercurrent
@@ -538,6 +538,7 @@ void monitor_stall_and_motor_current_callback()
   last_position_sensor_val_stall = position_sensor_val;
 }
 
+#ifdef RAIN_SENSOR
 const float rain_threshold = 3.0;  // Below this voltage, we say it is raining
 
 // Returns true if the rain sensor is conducting enough.  This will turn on the
@@ -553,84 +554,26 @@ bool is_raining(void)
 //    delay(100); // Hopefully the relay will close in less than 100 milliseconds
 //  }
 
+
   // Take a number of samples to get a better estimate of actual voltage.
   unsigned long rain_sensor_raw = 0;
   const int samples = 10;
   for (int i = 0 ; i < samples ; i++) {
    rain_sensor_raw += analogRead(RAIN_SENSE_IN);
   }
-//  rain_sensor_volts = ads.computeVolts(rain_sensor_raw / samples);
+  rain_sensor_raw /= samples;
+  rain_sensor_volts = ((float)rain_sensor_raw * 5000.0) / 1023.0
 
   return rain_sensor_volts < rain_threshold;
+
+
+  return false;
 }
 
-void turn_off_rain_sensor(void)
-{
-  
-}
+#endif
 
 int panel_movement_start_hour(void);
 int panel_movement_end_hour(void);
-
-/*
- * This is called periodically and is never disabled.  It measures the voltage on the output
- * of an op-amp whose input is connected to a circuit board that is exposed to the sky.  The circuit board
- * has two sets of traces that are interleaved.  When rain falls on these traces, there is a tiny conduction
- * from the op-amp input circuit and the voltage on the op-amp output falls.  When the board is dry, the op-amp
- * output is about 3.3V.  When it is wet, it falls to as low as .5V.  
- * 
- * This monitor function measures the voltage and considers anything below 1.6V to be wet.  If the mode is not
- * in a stow mode and not in no-operation mode, then we drive the panels down.  If the voltage is above 1.6 V and we 
- * are in rain-stow mode, then we count 200 "beats" or calls to this function.  At 30 seconds per call, it will take 100
- * minutes.  After this, if the sensor is still dry, we exit rain-stow mode for either time-mode or position-mode.
- */
-
-void monitor_rain_sensor_callback() 
-{
-  int h = hour(now());
-  bool panel_movement_time = panel_movement_start_hour() <= h && h <= panel_movement_end_hour();
-  if (panel_movement_time &&
-      !panels_going_up && 
-      !panels_going_down && 
-      calvals.operation_mode != no_panel_movement_mode && 
-      calvals.operation_mode != rain_stow_mode && 
-      is_raining()) {
-
-    turn_off_rain_sensor(); // Now that we know it is raining, preserve the contacts by depowering it for an hour
-    Serial.println(F("# alert rain stow"));
-    calvals.operation_mode = rain_stow_mode;
-    if (!at_lower_position_limit) {
-      drive_panels_down(F("rain-stow"), false);
-    }
-    monitor_rain_sensor.setInterval(60UL * 60UL * 1000UL); // 60 minutes so that we don't turn the rain sensor on too often
-
-    // The sensor is now dry, if we are in rain-stow mode, then start incrementing a counter
-    // If that counter gets to some value, which indicates the sensor has been dry for a while, then
-    // leave rain-stow mode and go into position mode if the position sensor seems to work or time mode if it does not.
-  } else if (calvals.operation_mode == rain_stow_mode) {
-    static unsigned long rain_stopped_time = 0UL;
-    bool raining = is_raining();
-    turn_off_rain_sensor();
-    if (raining) {
-      rain_stopped_time = 0;     // It is still raining, keep this set to zero.
-    } else {
-      if (rain_stopped_time == 0) {
-        rain_stopped_time = millis();
-      } else {
-        if ((millis() - rain_stopped_time) > 7200 * 1000UL) {
-          Serial.println(F("# alert leaving rain-stow mode, resuming normal operation"));
-          // The rain stopped two hours ago, leave rain-stow mode.
-          calvals.operation_mode = position_mode;
-          rain_stopped_time = 0;
-          monitor_rain_sensor.setInterval(30 * 1000UL); // Back to normal checking for rain every 30 seconds
-          if (!panel_movement_time) {
-            monitor_rain_sensor.disable();
-          }
-        }
-      }
-    }
-  }
-}
 
 /*
    Check to see if the sun angle sensor is showing that the sun has move to be higher in the sky and so the suns rays are no
@@ -724,31 +667,13 @@ void drive_panels_to_desired_position(void)
   // If it is the right time of day to raise the panels, we haven't stalled too many times today, and it has
   // been at least 30 minutes since the last time we raised the panels, then consider further raising them
 
-  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (millis() - last_drive_panels_up_time) > 30 * 60 * 1000UL) {
-    monitor_rain_sensor.enable();
-    int position_range = calvals.position_upper_limit - calvals.position_lower_limit;
-    int minute_range = (top_position_hour - raise_hour) * 60;
-    int minutes_from_start = (h - raise_hour) * 60 + minutes_of_hour;
-    float percentage_of_position = (float)minutes_from_start / (float)minute_range;
-    if (percentage_of_position > 1.0) {
-      percentage_of_position = 1.0;
-    }
-    int desired_position_offset = (float)position_range * percentage_of_position;
-    desired_position = calvals.position_lower_limit + desired_position_offset;
-    if (desired_position > calvals.position_upper_limit) {
-      desired_position = calvals.position_upper_limit;  // This should be redundant with check above
-    }
+  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (millis() - last_drive_panels_up_time) > 1 * 60 * 1000UL) {
+    desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
     if (desired_position > (position_sensor_val + 10 /* hysterisis */)) {
-      monitor_rain_sensor.enable();
-      if (is_raining() == false) {
-        drive_panels_up();
-      }
+      drive_panels_up();
     }
-  } else if (lower_hour <= h) {
-    turn_off_rain_sensor();  // With panels all the way down, no need to monitor for rain
-    monitor_rain_sensor.disable();
-    drive_panels_down(F("stowing for night"), true);
-  }
+  } 
+
   // At midnight, reset the number of daily stalls
   if (h == 0 && daily_stalls > 0) {
     snprintf(cbuf, sizeof(cbuf), "#%3d", daily_stalls);
@@ -773,9 +698,6 @@ void control_hydraulics_callback()
       if (time_of_day_valid) {
         drive_panels_to_desired_position();
       }
-      break;
-
-    case rain_stow_mode:
       break;
 
     default:
@@ -821,21 +743,6 @@ void monitor_serial_console_callback(void)
         }
         break;
 
-        case 'r':
-          rain_stow_disable = !rain_stow_disable;
-          if (rain_stow_disable) {
-            Serial.println(F("# rain stow disabled"));
-            monitor_rain_sensor.disable();
-            turn_off_rain_sensor();
-            if (calvals.operation_mode == rain_stow_mode) {
-              calvals.operation_mode = position_mode;
-            }
-          } else {
-            Serial.println(F("# rain stow enabled"));
-            monitor_rain_sensor.enable();
-          }
-          break;
-
         default:
           Serial.print(F("# Unknown command: "));
           Serial.println(command_buf);
@@ -877,6 +784,7 @@ void setup()
      s that we can set today's cron string.  We need to do that before running in time_mode.
   */
   read_time_and_sensor_inputs_callback();
+  setTime(0, 0, 0, 1, 1, 2026);  // So that we never get an invalid time due to library caching
   Serial.println(F("# Init done"));
 }
 
@@ -898,10 +806,6 @@ const char *operation_mode_string(void)
 
     case position_mode:
       return ("position");
-      break;
-
-    case rain_stow_mode:
-      return ("rain");
       break;
 
     default:

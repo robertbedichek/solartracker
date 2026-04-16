@@ -19,10 +19,10 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/watch_serial.log</string>
+    <string>/tmp/watch_solartracker_serial.log</string>
     
     <key>StandardErrorPath</key>
-    <string>/tmp/watch_serial.err</string>
+    <string>/tmp/watch_solartracker_serial.err</string>
 </dict>
 </plist>
 
