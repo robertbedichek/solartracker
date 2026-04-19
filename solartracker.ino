@@ -31,6 +31,9 @@ const unsigned long max_solenoid_on_time = 1800 * 1000UL;
 const unsigned long max_solenoid_off_time = 2700 * 1000UL;
 unsigned long solenoid_power_supply_on_off_time;  // Value of millis() when we last turned on the solenoid on or off
 
+// Value of millis() the last time we drove the panels up
+unsigned long last_drive_panels_up_time;
+
 bool time_of_day_valid = true;
 
 /*
@@ -46,7 +49,6 @@ int desired_position = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 90;
-bool panels_retracted;
 
 //   We can operate in one of three modes.  The first is a kind of "off" mode where we stay alive, talk on the
 //   serial port, update the LCD, but do not move the panels.   The two "on" modes are Sun-sensor mode and time-of-day/day-of-year mode.
@@ -92,16 +94,17 @@ bool at_upper_position_limit = false, at_lower_position_limit = false;
    This is from the 1000mm pull-string sensor that tells us where the panels are.
 */
 float position_sensor_val;                // Raw ADC values 0..1023 for 0..5V
-float pv_current_sensor_val;              // Raw ADS values of PV current clamp sensor values
-float pv_current;                    // Amps flowing past Hall Effect current sensor
+float pv_current(void);                   // Amps flowing past Hall Effect current sensor clamped to a solar panel DC cable
+float peak_pv_current;                    // Highest recorded PV current during last panel raise 
 
 unsigned last_position_sensor_val;        // Position value at last call to status print
 unsigned last_position_sensor_val_stall;  // Position sensor value at last sample in monitor_motor_stall_callback()
 
+
 //---------------------------------------------------------------------------------------------------
 
 void read_time_and_sensor_inputs_callback();
-Task read_time_and_sensor_inputs(500, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
+Task read_time_and_sensor_inputs(TASK_SECOND, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 
 void print_status_to_serial_callback();
@@ -138,7 +141,7 @@ bool panels_going_down = false;
    Set the calibration values to their "factory default".
 */
 void set_calvals_to_defaults() {
-  calvals.position_upper_limit = 320;  // Max position value (i.e., fully tilted up) minus overshoot (real max is around 363)
+  calvals.position_upper_limit = 340;  // Max position value (i.e., fully tilted up) minus overshoot (real max is around 363)
   calvals.position_lower_limit = 70;
   calvals.operation_mode = position_mode;  // Mode in which we should start operation
 }
@@ -161,6 +164,16 @@ void turn_off_motor_power_supply(void)
   pinMode(MOTOR_PS_SSR_ENABLE_PIN, INPUT);
   digitalWrite(MOTOR_PS_SSR_ENABLE_PIN, LOW);  // We write the bit with a zero ust so we can query later to see the state 
 }
+
+// Return true if the Arduino is commanding the SSR that controls the motor power supply to be on.  However,
+// for the motor power supply to be energized, it also needs to be the case that the limit switch is still conducting
+// (and thus that the panels are not at their upper limit).
+
+bool motor_power_supply_is_on(void)
+{
+  return digitalRead(MOTOR_PS_SSR_ENABLE_PIN) != 0;
+}
+
 void turn_on_solenoid_power_supply(void) 
 {
   if (solenoid_power_supply_is_on() == false) {
@@ -195,9 +208,14 @@ bool solenoid_power_supply_is_on(void)
 void stop_driving_panels(const __FlashStringHelper *who_called) 
 {
   turn_off_motor_power_supply();
+  turn_off_solenoid_power_supply();
+  read_time_and_sensor_inputs.setInterval(TASK_SECOND);
+  print_status_to_serial.setInterval(TASK_SECOND);
 
   if (who_called != (void *)0) {
-    Serial.print(F("# stop_driving_panels(): "));
+    Serial.print(F("# stop_driving_panels() secs=: "));
+    Serial.print((unsigned)((millis() - last_drive_panels_up_time) / 1000ULL));
+    Serial.print(F(", why="));
     Serial.println(who_called);
   }
   panels_going_down = false;
@@ -208,7 +226,6 @@ void stop_driving_panels(const __FlashStringHelper *who_called)
    */
   monitor_position_limits.disable();
   monitor_stall_and_motor_current.disable();
-  // turn_off_solenoid_power_supply();
 }
 
 /*
@@ -223,9 +240,6 @@ void fail(const __FlashStringHelper *fail_message) {
   abort();
 }
 
-// Value of millis() the last time we drove the panels up
-unsigned long last_drive_panels_up_time;
-
 /*
    Start the panels moving up and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going down when this was called.
@@ -238,11 +252,14 @@ void drive_panels_up(void)
     
     Serial.println(F("# lift "));
     turn_on_motor_power_supply();
+    last_drive_panels_up_time = millis();
+    peak_pv_current = pv_current();     // Start new peak-finding interval
     panels_going_up = true;
     stall_start_time = 0;
     under_current_start_time = 0;
-    panels_retracted = false;
     last_position_sensor_val_stall = position_sensor_val;
+    read_time_and_sensor_inputs.setInterval(100); // Sample quickly when panels are in motion
+    print_status_to_serial.setInterval(200);
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -252,9 +269,9 @@ void drive_panels_up(void)
    Start the panels moving down and enable the task that monitors position and estimated temperature.  It is a fatal
    error if the panels were going up when this was called.
 */
-void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_without_power) 
+void drive_panels_down(const __FlashStringHelper *why) 
 {
-  if (at_lower_position_limit || panels_retracted) {
+  if (at_lower_position_limit) {
     return;
   } else if (panels_going_up) {
     fail(F("drive_panels_down"));
@@ -266,9 +283,21 @@ void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_with
     panels_going_down = true;
     stall_start_time = 0;
     under_current_start_time = 0;
-    panels_retracted = true;
     monitor_position_limits.enable();
   }
+}
+
+// --- Insertion sort (in-place, ascending) --------------------------------
+static void insertionSort(int arr[], int n) {
+    for (int i = 1; i < n; i++) {
+        int key = arr[i];
+        int j   = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
 }
 
 /*
@@ -276,61 +305,36 @@ void drive_panels_down(const __FlashStringHelper *why, bool let_panels_fall_with
 */
 void read_time_and_sensor_inputs_callback() 
 {
-  const float ema_alpha = 0.1;
-  float alpha;
-  const int samples = 10;  // # of samples in arithmetic average
+#define NUM_SAMPLES (16)
+#define TRIM_COUNT  (2)       // discard this many from each end
 
-  float position_sensor_val_temp = 0.0;
-  float pv_current_sensor_val_temp = 0.0;
+  int samples[NUM_SAMPLES];  // Array of
 
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    samples[i] = analogRead(DRAW_STRING_IN);
+    delay(1); // Ensure that we take samples over more than one 60 Hz interval
+  }
+  insertionSort(samples, NUM_SAMPLES);
+
+  // Sum the middle samples, skipping TRIM_COUNT on each end
+  long sum = 0;
+  const int keepCount = NUM_SAMPLES - 2 * TRIM_COUNT;
+  for (int i = TRIM_COUNT; i < NUM_SAMPLES - TRIM_COUNT; i++) {
+    sum += samples[i];
+  }
+ 
+  // Still too noisy, so use EMA filter with high alpha (for faster response, less filtering)
+  float alpha = 0.3;
   static bool first_time = true;
-
   if (first_time) {
     alpha = 1.0;
     first_time = false;
-  } else {
-    alpha = ema_alpha;
   }
 
-  for (int sample = 0; sample < samples; sample++) {
-   
-        /*
-        The values we read for the sun sensor and position sensors jump around, I guess due to noise.  To compensate and
-        have more stable values average the last reading with this reading (and the 'last reading' is a running average)
-    */
-  //  int solar_raw = ads.readADC_SingleEnded(/* ADS1115 input */ 3);
-//     solar_volts_temp += ads.computeVolts(solar_raw);
+  float new_val = (float)sum / keepCount;
+  position_sensor_val = alpha * new_val + (1 - alpha) * position_sensor_val;
 
-    unsigned position_sensor_raw = (unsigned)analogRead(DRAW_STRING_IN);
-    position_sensor_val_temp += position_sensor_raw;
-
-    unsigned pv_current_sensor_raw = (unsigned)analogRead(PV_CURRENT_SENSE_IN);
-    pv_current_sensor_val_temp += pv_current_sensor_raw;
-  }
-
-  position_sensor_val_temp /= samples;
-  position_sensor_val = alpha * position_sensor_val_temp + (1 - alpha) * position_sensor_val;
-
-  pv_current_sensor_val_temp /= samples;
-  pv_current_sensor_val = alpha * pv_current_sensor_val_temp + (1 - alpha) * pv_current_sensor_val;
-
-  float pv_current_sensor_millivolts = (pv_current_sensor_val * 5000.0) / 1023.0;
-  pv_current = (2476.4 - pv_current_sensor_millivolts) / 100.0;
-
-  if (pv_current < 0) {
-    pv_current = 0;
-  }
-  static bool verbose = false;
-  if (verbose) {
-    static int prints = 0;
-    if (prints++ < 10){
-      Serial.print(pv_current_sensor_val_temp); Serial.print(F(" "));
-      Serial.print(pv_current_sensor_val); Serial.print(F(" "));
-      Serial.println(pv_current_sensor_millivolts);
-    }
-  }
-
-  at_upper_position_limit = position_sensor_val >= calvals.position_upper_limit;
+  at_upper_position_limit = position_sensor_val >= (calvals.position_upper_limit - 20);
   at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;  // Panels are at a good lower position when position_sensor_val is 50
 }
 
@@ -355,6 +359,38 @@ int motor_amps(void)
   return (int)(motor_current_sense_millivolts / 7.5); // Shunt resistor is 75 mV per 10 amps
 }
 
+// Return the number of amps that one of the panels is producing.  We use this to help determine
+// the optimal panel position.  
+
+float pv_current(void)
+{
+  unsigned pv_current_sensor_raw = 0.0;
+
+  const int samples = 10;
+  for (int sample = 0; sample < samples; sample++) {
+    pv_current_sensor_raw += (unsigned)analogRead(PV_CURRENT_SENSE_IN);
+    delay(1);
+  }
+
+  pv_current_sensor_raw /= samples;
+
+  float pv_current_sensor_millivolts = (pv_current_sensor_raw * 5000.0) / 1023.0;
+  float pv_current_val = (2476.4 - pv_current_sensor_millivolts) / 100.0;
+
+  if (pv_current_val < 0) {
+    pv_current_val = -pv_current_val;
+  }
+  if (false) {
+    static int cnt = 0 ;
+    if (cnt++ < 10) {
+      Serial.print(F("# raw=")); Serial.print(pv_current_sensor_raw); 
+      Serial.print(F(" millivolts=")); Serial.print(pv_current_sensor_millivolts); 
+      Serial.print(F(" val=")); Serial.println(pv_current_val);
+    }
+  }
+  
+  return pv_current_val;
+}
 
 /*
    This is the main system tracing function.  It emits a line of ASCII to USB serial line with lots of information.
@@ -369,47 +405,42 @@ void print_status_to_serial_callback(void)
 {
   static char line_counter = 0;
   static enum mode_e last_operation_mode = last_mode;  // Force a difference the first time
-  // static float last_solar_volts;
-  static bool last_at_upper_position_limit;
-  static bool last_at_lower_position_limit;
   static bool last_panels_going_up;
   static bool last_panels_going_down;
+  static bool last_solenoid_is_on;
+  static bool last_motor_is_on;
   static int last_motor_amps;
   static float last_pv_current;
-  static unsigned skipped_record_counter;
+  static int skipped_record_counter = 0;
   
   int position_difference;  // Amount position changed since last call to status print
   if (last_position_sensor_val == 0) {
     last_position_sensor_val = position_sensor_val;
   }
   position_difference = position_sensor_val - last_position_sensor_val;
-
-  if (abs(position_difference) > 5 || 
+  
+  if (abs(position_difference) > 14 || 
      last_operation_mode != calvals.operation_mode || 
-     // abs(last_solar_volts - solar_volts) > 0.1 || 
-     last_at_upper_position_limit != at_upper_position_limit || 
-     last_at_lower_position_limit != at_lower_position_limit || 
      last_panels_going_up != panels_going_up || 
      last_panels_going_down != panels_going_down || 
+     last_solenoid_is_on != solenoid_power_supply_is_on() ||
+     last_motor_is_on != motor_power_supply_is_on() ||
      last_motor_amps != (int)motor_amps() ||
-     (int)last_pv_current != (int)pv_current ||
+    // (int)last_pv_current != (int)pv_current ||
     //  last_solenoid_power_supply_is_on != solenoid_power_supply_is_on() ||
-     
-     skipped_record_counter++ > 1000) {
+     (panels_going_up || skipped_record_counter-- <= 0)) {
 
     last_position_sensor_val = position_sensor_val;
     last_operation_mode = calvals.operation_mode;
-//     last_solar_volts = solar_volts;
-    last_at_upper_position_limit = at_upper_position_limit;
-    last_at_lower_position_limit = at_lower_position_limit;
     last_panels_going_up = panels_going_up;
     last_panels_going_down = panels_going_down;
+    last_solenoid_is_on = solenoid_power_supply_is_on();
     last_motor_amps = (int)motor_amps();
-    last_pv_current = pv_current;
-    skipped_record_counter = 0;
+    last_pv_current = pv_current();
+    skipped_record_counter = at_lower_position_limit ? 1800 : 180;
 
     if (line_counter == 0) {
-      Serial.println(F("# Date     Time     Md Pos  Amps UpL Dnl GUp GDn PV Amps"));
+      Serial.println(F("# Date     Time     Md Pos  Amps UpL Dnl GUp GDn Sol Mot PV Amps"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -435,14 +466,19 @@ void print_status_to_serial_callback(void)
              (int)motor_amps());
     Serial.print(cbuf);
 
-    snprintf(cbuf, sizeof(cbuf), " %3d %3d %3d %3d ",
+    snprintf(cbuf, sizeof(cbuf), " %3d %3d %3d %3d",
              at_upper_position_limit,
              at_lower_position_limit,
              panels_going_up,
              panels_going_down);
     Serial.print(cbuf);
 
-    dtostrf(pv_current, 4, 1, cbuf); 
+    snprintf(cbuf, sizeof(cbuf), " %3d %3d  ",
+             solenoid_power_supply_is_on(),
+             motor_power_supply_is_on());
+    Serial.print(cbuf);
+
+    dtostrf(pv_current(), 4, 1, cbuf); 
 
     Serial.println(cbuf);
   }
@@ -454,24 +490,25 @@ void print_status_to_serial_callback(void)
 void monitor_position_limits_callback() 
 {
   if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
-    last_drive_panels_up_time = millis();
+
     stop_driving_panels((void *)0 /* F("upper limit reached") */);
   }
   if (panels_going_down) {
     if (position_sensor_val <= (calvals.position_lower_limit - position_hysteresis)) {
       stop_driving_panels((void *)0 /* F("lower limit reached") */);
-    }
+    } else {
       if (hour(now()) == 8) {
         // By 8AM, give up letting the panels fall so that we can reset global flags and be ready to start raising the panels
         stop_driving_panels((void *)0 /* F("letting panels fall") */);
+      } else {
+        // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
+        if (solenoid_power_supply_is_on() && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_on_time) {
+          turn_off_solenoid_power_supply();
+        } else if (solenoid_power_supply_is_on() == false && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_off_time) {
+          turn_on_solenoid_power_supply();
+        }
       }
-      // Turn the solenoid on and off until the panels reach the lower limit or 8AM rolls around
-      if (solenoid_power_supply_is_on() && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_on_time) {
-        turn_off_solenoid_power_supply();
-      } else if (solenoid_power_supply_is_on() == false && (millis() - solenoid_power_supply_on_off_time) > max_solenoid_off_time) {
-        turn_on_solenoid_power_supply();
-      }
-
+    }
   }
 }
 
@@ -520,10 +557,16 @@ void monitor_stall_and_motor_current_callback()
   if (amps < motor_current_threshold_low) {
     if (under_current_start_time == 0) {
       under_current_start_time = millis();
-    } else if ((millis() - under_current_start_time) > 9000) {
-      stop_driving_panels(F("low current for 9 seconds"));
-      daily_stalls++;
-      Serial.println(daily_stalls);
+    } else if ((millis() - under_current_start_time) > 2000) {
+      if (position_sensor_val < 150) {
+        stop_driving_panels(F("low current for 2 seconds at low panel angle"));
+        daily_stalls++;
+      } else {
+        stop_driving_panels(F("low current for 2 seconds .. probably at upper stop"));
+        Serial.print(F("# setting upper position limit to current position: "));
+        Serial.println(position_sensor_val);
+        calvals.position_upper_limit = position_sensor_val;
+      }      
     }
   } else {
     under_current_start_time = 0; // Not taking too little, reset the start time of undercurrent
@@ -534,6 +577,16 @@ void monitor_stall_and_motor_current_callback()
       Serial.print(F("# amps="));
       Serial.println(amps);
     }
+  }
+  float pv = pv_current();
+  if (peak_pv_current < pv) {
+    peak_pv_current = pv;
+  } else if (pv < (peak_pv_current - 2.0)) {
+    stop_driving_panels(F("decreasing panel current"));
+    Serial.print(F("# pv amps=")); 
+    Serial.println(pv);
+    Serial.print(F(", peak="));
+    Serial.println(peak_pv_current);
   }
   last_position_sensor_val_stall = position_sensor_val;
 }
@@ -666,13 +719,31 @@ void drive_panels_to_desired_position(void)
   
   // If it is the right time of day to raise the panels, we haven't stalled too many times today, and it has
   // been at least 30 minutes since the last time we raised the panels, then consider further raising them
-
-  if (raise_hour <= h && h < lower_hour && daily_stalls < 5 && (millis() - last_drive_panels_up_time) > 1 * 60 * 1000UL) {
-    desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
+  float pv = pv_current();
+  bool sufficient_delay_since_last_raise = (millis() - last_drive_panels_up_time) > 30 * 60 * 1000UL;
+  if (last_drive_panels_up_time == 0) {
+    sufficient_delay_since_last_raise = true; // Let them go up right after booting, to make testing faster
+  }
+  if (pv > 0.1 && raise_hour <= h && h < lower_hour && daily_stalls < 5 && sufficient_delay_since_last_raise) {
+    if (h >= top_position_hour) {
+      desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
+    } else {
+      desired_position = (calvals.position_upper_limit - calvals.position_lower_limit) / (top_position_hour - h) + calvals.position_upper_limit;
+    }
     if (desired_position > (position_sensor_val + 10 /* hysterisis */)) {
       drive_panels_up();
     }
-  } 
+  } else {
+    if (false) {
+      static int cnt = 0; 
+      if (cnt++ < 10) {
+        Serial.print(h); Serial.print(" "); Serial.print(lower_hour); Serial.print(" "); Serial.println(pv_current());
+      }
+    }
+    if (h > lower_hour && pv < 0.2) {
+      drive_panels_down(F("time to lower panels and panel current low"));
+    }
+  }
 
   // At midnight, reset the number of daily stalls
   if (h == 0 && daily_stalls > 0) {

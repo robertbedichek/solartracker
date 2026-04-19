@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+  <title>Solar-Thermal System Performance</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; background: #f8f8f8; }
+    #solar_thermal_chart { width: 100%; height: 600px; }
+  </style>
+</head>
+<body>
+  <h2>Solar Thermal Performance </h2>
+  <div id="solar_thermal_chart"></div>
+
+  <script>
+
+  window.addEventListener('load', () => {
+   fetch("solarthermal.txt")
+  .then(response => response.text())
+  .then(dataText => {
+    const lines = dataText.trim().split("\n");
+
+    const time = [], tank = [], lpan = [], rpan = [], aveg = [], spat = [], mode=[];
+
+    // Boolean traces (will show up as dots)
+    const boolTraces = Array.from({ length: 7 }, () => ({ x: [], y: [] }));
+
+    for (let line of lines) {
+      if (line.startsWith("#") || line.trim() === "") continue;
+
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 14) {
+        console.warn("Skipping malformed line:", line);
+        continue;
+      }
+
+      const ts = new Date(`${parts[0]}T${parts[1]}`);
+      time.push(ts);
+
+      tank.push(parseInt(parts[2], 10));
+      lpan.push(parseInt(parts[3], 10));
+      rpan.push(parseInt(parts[4], 10));
+      aveg.push(parseInt(parts[5], 10));
+      spat.push(parseInt(parts[6], 10));
+      const operating_mode = parseInt(parts[15], 10);
+      if (operating_mode) {
+        mode.push(160 + 3 * operating_mode ); 
+      }
+
+      // Parse and plot boolean fields as fixed Y-level dots
+      for (let i = 0; i < 7; i++) {
+        if (parts[7 + i] !== undefined) {
+          const value = parseInt(parts[7 + i], 10);
+          if (value) {
+            boolTraces[i].x.push(ts);
+            boolTraces[i].y.push(180 + 3*i);  // higher Y so dots appear above temperature lines
+          }
+        }
+      }
+    }
+
+    const layout = {
+      title: "Solar Thermal Sensors + Events",
+      xaxis: { title: "Time", type: "date" },
+      yaxis: { title: "Temperature (°F) / Event Flags" },
+      legend: { orientation: "h" }
+    };
+
+    const sensorTraces = [
+      { x: time, y: tank, type: 'scatter', mode: 'lines+markers', name: 'Tank', line: { width: 1 }, marker: { size: 2 }},
+      { x: time, y: lpan, type: 'scatter', mode: 'lines+markers', name: 'Leftmost Panel', line: { width: 1 }, marker: { size: 2 } },
+      { x: time, y: rpan, type: 'scatter', mode: 'lines+markers', name: 'Rightmost Panel', line: { width: 1 }, marker: { size: 2 } },
+//      { x: time, y: aveg, type: 'scatter', mode: 'lines+markers', name: 'Average Panel', line: { width: 1 }, marker: { size: 2 } },
+      { x: time, y: spat, type: 'scatter', mode: 'lines+markers', name: 'Spa', line: { width: 1 } }
+    ];
+
+    const boolNames = ["Spa Heater Enabled", "Solar Pump", "Recirculation Pump", "Takagi Heater", "Spa Calling for heat", "Spa Valve Open", "Roof Valve to Pool", "Pool Heat Request"];
+    const boolColors = ["cyan", "orange", "grey", "black", "pink", "green", "red"];
+
+    const eventTraces = boolTraces.map((t, i) => ({
+      x: t.x,
+      y: t.y,
+      type: 'scatter',
+      mode: 'markers',
+      marker: {
+        symbol: 'circle',
+        size: 4,
+        color: boolColors[i] || 'black'
+      },
+      name: boolNames[i]
+    }));
+
+    Plotly.newPlot('solar_thermal_chart', [...sensorTraces, ...eventTraces], layout);
+  })
+  .catch(err => {
+    console.error("Plot generation error:", err);
+  })
+  });
+</script>
+
+<H2><a href="https://github.com/robertbedichek/solarthermal/wiki">Solar-Thermal System Design Wiki</a>
+<hr>
+</H2>
+
+<H2> Pool Controller Performance </h2>
+
+<div id="poolpumpcontrol_chart" style="height:600px;"></div>
+
+<script>
+fetch('poolpumpcontrol.txt')
+
+
+// Sample content of poolpumpcontrol.txt: 
+//  Date     Time      Pl1 Pl2 Out PSI  Pmp Bst Req Roof Mode
+// 2025-10-28 15:22:08   65  62  79  0.0   0   0   0   0    0
+
+  .then(response => response.text())
+  .then(rawData => {
+    const lines = rawData.trim().split('\n');
+
+    const headerLine = lines.find(line => line.startsWith('#') && line.includes('Date') && line.includes('Time'));
+
+    const header = headerLine.replace(/^#\s*/, '').split(/\s+/);
+
+    const dataLines = lines.filter(line => !line.startsWith('#') && line.trim().length > 0);
+    const data = dataLines.map(line => line.trim().split(/\s+/));
+
+    const colIndex = name => header.indexOf(name);
+
+    const timestamps = data.map(row => new Date(`${row[colIndex("Date")]}T${row[colIndex("Time")]}`));
+    const pl1 = data.map(row => parseFloat(row[colIndex("Pl1")]));
+    const pl2 = data.map(row => parseFloat(row[colIndex("Pl2")]));
+    const out = data.map(row => parseFloat(row[colIndex("Out")]));
+    const psi = data.map(row => parseFloat(row[colIndex("PSI")]));
+    const traces = [
+      {
+        x: timestamps,
+        y: pl1,
+        name: 'Pool Temperature 1',
+        line: { width: 1 }, marker: { size: 2 },
+        mode: 'lines+markers',
+        type: 'scatter'
+      },
+//      {
+//        x: timestamps,
+//        y: pl2,
+//        name: 'Pool Temperature 2',
+//        line: { width: 1 }, marker: { size: 2 },
+//        mode: 'lines+markers',
+//        type: 'scatter'
+//      },
+      {
+        x: timestamps,
+        y: out,
+        name: 'Outside Temperature',
+        line: { width: 1 }, marker: { size: 2 },
+        mode: 'lines+markers',
+        type: 'scatter'
+      },
+      {
+        x: timestamps,
+        y: psi,
+        name: 'PSI',
+        line: { width: 1 }, marker: { size: 2 },
+        mode: 'lines+markers',
+        type: 'scatter',
+        yaxis: 'y2'
+      }
+    ];
+
+    // Boolean fields (e.g. 0 or 1), plotted as discrete points at fixed Y levels
+    const boolNames = ["Pmp", "Bst", "Req", "Roof"];
+    const boolColors = ["black", "red", "green", "blue"];
+    const boolOffsetY = 100; // vertical offset for dots above data lines
+
+    const displayNames = ["Main Pump", "Boost Pump", "Request For Water To Roof", "Diverter Valve Sending Water To Roof"];
+
+    boolNames.forEach((col, idx) => {
+    const yVals = [], xVals = [];
+    data.forEach((row, i) => {
+      if (parseInt(row[colIndex(col)]) === 1) {
+        xVals.push(timestamps[i]);
+        yVals.push(boolOffsetY + idx * 3); // stack markers upward
+      }
+    });
+    traces.push({
+      x: xVals,
+      y: yVals,
+      mode: 'markers',
+      type: 'scatter',
+      name: displayNames[idx],
+      marker: { size: 2, color: boolColors[idx] },
+      yaxis: 'y'
+    });
+  });
+
+
+    const layout = {
+      title: 'Pressure and Valve Events',
+      xaxis: { title: 'Time' },
+      yaxis: { title: 'Temperature / Pressure / Flag Markers' },
+      yaxis2: {
+        title: 'PSI',
+        overlaying: 'y',
+        side: 'right',
+        showgrid: false,
+        range: [0, 20]
+      },
+      legend: { orientation: 'h' }
+    };
+
+    Plotly.newPlot('poolpumpcontrol_chart', traces, layout);
+  })
+  .catch(err => {
+    console.error("Failed to load or parse poolpumpcontrol.txt", err);
+    document.getElementById("poolpumpcontrol_chart").innerText = "Error loading data.";
+  });
+</script>
+<h2>
+	<a href=https://github.com/robertbedichek/poolpumpcontrol/wiki>Pool Pump Controller Design Wiki</a></h2>
+
+  <h2>Solar Tracker Performance </h2>
+  <div id="solar_tracker_chart"></div>
+
+  <script>
+window.addEventListener('load', () => {
+  fetch('solartracker.txt')
+    .then(response => response.text())
+    .then(rawData => {
+
+      const lines = rawData.trim().split('\n');
+      const headerLine = lines.find(line => line.startsWith('#') && line.includes('Date'));
+      const header = headerLine.replace(/^#\s*/, '').split(/\s+/);
+      const dataLines = lines.filter(line => !line.startsWith('#') && line.trim().length > 0);
+
+      const data = dataLines.map(line => line.trim().split(/\s+/));
+      const colIndex = name => header.indexOf(name);
+
+      const timestamps = data.map(row => new Date(`${row[colIndex("Date")]}T${row[colIndex("Time")]}`));
+
+      const position = data.map(row => parseFloat(row[colIndex("Pos")]));
+//      console.log('Position values:', position);
+
+      const pv_amps = data.map(row => parseFloat(row[colIndex("PV")]));
+
+      console.log('pv_amps:', pv_amps);
+
+
+      const lowerLimit = data.map(row => parseInt(row[colIndex("Dnl")]));
+      const upperLimit = data.map(row => parseInt(row[colIndex("UpL")]));
+      const solenoidOn = data.map(row => parseInt(row[colIndex("Sol")]));
+      const motorOn = data.map(row => parseInt(row[colIndex("Mot")]));
+
+      const traces = [
+        {
+          x: timestamps,
+          y: position,
+          name: 'Position',
+          mode: 'lines+markers',
+          type: 'scatter',
+          line: { color: 'green', width: 2 },
+          marker: { size: 3 }
+        },
+        {
+          x: timestamps,
+	  y: pv_amps.map(v => v * 10),
+          name: 'PV Current x10',
+          mode: 'lines+markers',
+          type: 'scatter',
+          line: { color: 'blue', width: 2 },
+          marker: { size: 3 }
+        },
+        {
+          x: timestamps,
+          y: lowerLimit.map(v => v ? 400 : null),
+          name: 'Panels at Lower Limit',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'black', size: 3 }
+        },
+        {
+          x: timestamps,
+          y: upperLimit.map(v => v ? 410 : null),
+          name: 'Panels at Upper Limit',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'red', size: 3 }
+        },
+        {
+          x: timestamps,
+          y: solenoidOn.mapwv => v ? 430 : null),
+          name: 'Solenoid On',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'green', size: 3 }
+        },
+        {
+          x: timestamps,
+          y: motorOn.mapwv => v ? 430 : null),
+          name: 'Motor On',
+          mode: 'markers',
+          type: 'scatter',
+          marker: { color: 'grey', size: 3 }
+        }
+      ];
+
+      const layout = {
+        title: 'Solar Tracker - Position, PV Current ',
+        xaxis: { title: 'Time' },
+        yaxis: { title: 'Value' }
+      };
+
+      Plotly.newPlot('solar_tracker_chart', traces, layout);
+    })
+    .catch(err => {
+      console.error('Failed to load data:', err);
+      document.getElementById('solar_tracker_chart').innerText = 'Error loading solartracker.txt';
+    });
+});
+</script>
+
+<H2> <a href=https://github.com/robertbedichek/solartracker/wiki> Solar Tracker Design Wiki</a></H2>
+<hr>
+
+  <h2>Xantrex Performance </h2>
+
+  <p><a href="/home/xantrex.html">Open the live Xantrex chart</a></p>
+<hr>
+
+</body>
+</html>
