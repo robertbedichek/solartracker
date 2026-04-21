@@ -46,9 +46,9 @@ def is_valid_data_line(line):
         return True  # Comment line is always OK
 
     parts = line.strip().split()
-    if len(parts) < 9:
-        print("must have at least 9 fields: ", line, " but has only ", len(parts))
-        return False  # Must have at least 11 fields
+    if len(parts) < 12:
+        print("must have at least 12 fields: ", line, " but has only ", len(parts))
+        return False  # Must have at least 12 fields
 
 # Assume 'parts' is a list like ['2025-06-06', '12:34:56'] from Arduino input
     date_part, time_part = parts[0], parts[1]
@@ -74,6 +74,8 @@ def is_valid_data_line(line):
         # Send date command
         datestamp = 'd ' + date.today().strftime('%Y-%m-%d')
         ser.write((datestamp + '\n').encode())
+        return False
+
       else:
 #        print("Target time is within acceptable range.")
 
