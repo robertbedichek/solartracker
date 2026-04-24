@@ -753,7 +753,7 @@ void drive_panels_to_desired_position(void)
   if (last_drive_panels_up_time == 0) {
     sufficient_delay_since_last_raise = true; // Let them go up right after booting, to make testing faster
   }
-  if (pv > 0.1 && raise_hour <= h && h < lower_hour && daily_stalls < 5 && sufficient_delay_since_last_raise) {
+  if (pv > 1.0 && raise_hour <= h && h < lower_hour && daily_stalls < 5 && sufficient_delay_since_last_raise) {
     if (h >= top_position_hour) {
       desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
     } else {
