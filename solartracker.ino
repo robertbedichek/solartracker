@@ -747,7 +747,7 @@ void drive_panels_to_desired_position(void)
     if (h >= top_position_hour) {
       desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
     } else {
-      desired_position = (calvals.position_upper_limit - calvals.position_lower_limit) / (top_position_hour - h) + calvals.position_upper_limit;
+      desired_position = (calvals.position_upper_limit - calvals.position_lower_limit) / (top_position_hour - h) + calvals.position_lower_limit;
     }
     if (desired_position > (position_sensor_val + 10 /* hysterisis */)) {
       drive_panels_up();
