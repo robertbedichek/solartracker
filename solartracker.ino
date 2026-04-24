@@ -107,8 +107,8 @@ void read_time_and_sensor_inputs_callback();
 Task read_time_and_sensor_inputs(TASK_SECOND, TASK_FOREVER, &read_time_and_sensor_inputs_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 
-void print_status_to_serial_callback();
-Task print_status_to_serial(TASK_SECOND, TASK_FOREVER, &print_status_to_serial_callback, &ts, true);
+void emit_telemetry_callback();
+Task emit_telemetry(TASK_SECOND, TASK_FOREVER, &emit_telemetry_callback, &ts, true);
 //---------------------------------------------------------------------------------------------------
 void control_hydraulics_callback();
 Task control_hydraulics(TASK_SECOND * 10, TASK_FOREVER, &control_hydraulics_callback, &ts, true);
@@ -203,7 +203,7 @@ void stop_driving_panels(const __FlashStringHelper *who_called)
   turn_off_motor_power_supply();
   turn_off_solenoid_power_supply();
   read_time_and_sensor_inputs.setInterval(TASK_SECOND);
-  print_status_to_serial.setInterval(TASK_SECOND);
+  emit_telemetry.setInterval(TASK_SECOND);
 
   if (who_called != (void *)0) {
     Serial.print(F("# stop_driving_panels() secs=: "));
@@ -252,7 +252,7 @@ void drive_panels_up(void)
     under_current_start_time = 0;
     last_position_sensor_val_stall = position_sensor_val;
     read_time_and_sensor_inputs.setInterval(100); // Sample quickly when panels are in motion
-    print_status_to_serial.setInterval(200);
+    emit_telemetry.setInterval(200);
     monitor_position_limits.enable();
     monitor_stall_and_motor_current.enable();
   }
@@ -320,9 +320,14 @@ void read_time_and_sensor_inputs_callback()
         }
       }
     }
-    if (samples[i] >= 380 && warnings++ < 100) {
-      Serial.print(F("# out of range: "));
-      Serial.println(samples[i]);
+    if (samples[i] >= 380) {
+      if (warnings++ < 100) {
+        Serial.print(F("# out of range: "));
+        Serial.println(samples[i]);
+      }
+      // We know that this sample is bad, but we tried to get a good value many times.  So
+      // substitute the last known value.
+      samples[i] = last_position_sensor_val; 
     }
   }
   insertionSort(samples, NUM_SAMPLES);
@@ -423,7 +428,7 @@ float pv_current(void)
 bool force_status_line = false;
 
 // Called periodically.  Sends relevant telemetry back over one or both of the serial channels
-void print_status_to_serial_callback(void) 
+void emit_telemetry_callback(void)
 {
   static char line_counter = 0;
   static enum mode_e last_operation_mode = last_mode;  // Force a difference the first time
