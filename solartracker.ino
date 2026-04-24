@@ -21,7 +21,6 @@
 #include <TimeLib.h>  // for update/display of time
 
 
-#include <SoftwareSerial.h>
 
 // This string variable is used by multiple functions below, but not at the same time
 char cbuf[55];
@@ -70,7 +69,6 @@ enum mode_e { no_panel_movement_mode,
 // of the solar panels
 #define PV_CURRENT_SENSE_IN (2)
 
-const char *operation_mode_string(void);
 
 /*
     Central (and only) task scheduler data structure.
@@ -339,16 +337,7 @@ void read_time_and_sensor_inputs_callback()
     sum += samples[i];
   }
  
-  // Still too noisy, so use EMA filter with high alpha (for faster response, less filtering)
-  float alpha = 1.0;
-  static bool first_time = true;
-  if (first_time) {
-    alpha = 1.0;
-    first_time = false;
-  }
-
-  float new_val = (float)sum / keepCount;
-  position_sensor_val = alpha * new_val + (1 - alpha) * position_sensor_val;
+  position_sensor_val = (float)sum / keepCount;
 
   at_upper_position_limit = position_sensor_val >= (calvals.position_upper_limit - 20);
   at_lower_position_limit = position_sensor_val < calvals.position_lower_limit;  // Panels are at a good lower position when position_sensor_val is 50
@@ -440,20 +429,21 @@ void emit_telemetry_callback(void)
   static float last_pv_current;
   static int skipped_record_counter = 0;
   
+  int cur_motor_amps = motor_amps();
   int position_difference;  // Amount position changed since last call to status print
   if (last_position_sensor_val == 0) {
     last_position_sensor_val = position_sensor_val;
   }
   position_difference = position_sensor_val - last_position_sensor_val;
-  
-  if (force_status_line || 
-    abs(position_difference) > 10 || 
-     last_operation_mode != calvals.operation_mode || 
-     last_panels_going_up != panels_going_up || 
-     last_panels_going_down != panels_going_down || 
+
+  if (force_status_line ||
+    abs(position_difference) > 10 ||
+     last_operation_mode != calvals.operation_mode ||
+     last_panels_going_up != panels_going_up ||
+     last_panels_going_down != panels_going_down ||
      last_solenoid_is_on != solenoid_power_supply_is_on ||
      last_motor_is_on != motor_power_supply_is_on ||
-     last_motor_amps != (int)motor_amps() ||
+     last_motor_amps != cur_motor_amps ||
      (panels_going_up || skipped_record_counter-- <= 0)) {
 
     last_position_sensor_val = position_sensor_val;
@@ -461,7 +451,8 @@ void emit_telemetry_callback(void)
     last_panels_going_up = panels_going_up;
     last_panels_going_down = panels_going_down;
     last_solenoid_is_on = solenoid_power_supply_is_on;
-    last_motor_amps = (int)motor_amps();
+    last_motor_is_on = motor_power_supply_is_on;
+    last_motor_amps = cur_motor_amps;
     last_pv_current = pv_current();
     skipped_record_counter = at_lower_position_limit ? 900 : 180;
     force_status_line = false;
@@ -489,7 +480,7 @@ void emit_telemetry_callback(void)
     snprintf(cbuf, sizeof(cbuf), "%d %4d %4d",
              calvals.operation_mode,
              (int)position_sensor_val,
-             (int)motor_amps());
+             cur_motor_amps);
     Serial.print(cbuf);
 
     snprintf(cbuf, sizeof(cbuf), " %3d %3d %3d %3d",
@@ -504,7 +495,7 @@ void emit_telemetry_callback(void)
              motor_power_supply_is_on);
     Serial.print(cbuf);
 
-    dtostrf(pv_current(), 4, 1, cbuf); 
+    dtostrf(last_pv_current, 4, 1, cbuf);
 
     Serial.println(cbuf);
   }
@@ -720,7 +711,6 @@ void drive_panels_to_desired_position(void)
 {
   time_t t = now();
   int h = hour(t);
-  int minutes_of_hour = minute(t);
   int raise_hour = panel_movement_start_hour();          // Hour to start raising panels (default for winter)
   int top_position_hour = 10;  // Hour at which panels should be in top position
   int lower_hour = panel_movement_end_hour();         // Hour at which considering lowering panels, wait for dark to lower them
@@ -899,22 +889,4 @@ void loop()
   ts.execute();
 }
 
-const char *operation_mode_string(void) 
-{
-  switch (calvals.operation_mode) {
-    case no_panel_movement_mode:
-      return ("no-panel-movement");
-      break;
-
-    case position_mode:
-      return ("position");
-      break;
-
-    default:
-      fail(F("??mode"));
-      break;
-  }
-}
-
-  
 
