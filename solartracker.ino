@@ -33,7 +33,6 @@ unsigned long solenoid_power_supply_on_off_time;  // Value of millis() when we l
 // Value of millis() the last time we drove the panels up
 unsigned long last_drive_panels_up_time;
 
-bool time_of_day_valid = true;
 
 /*
    Speed at which we run the USB serial connection 
@@ -41,10 +40,6 @@ bool time_of_day_valid = true;
 const unsigned long serial_baud = 115200;
 
 const int position_hysteresis = 5;
-/*
- * This global variable is set to the position value to which we are trying to raise the panels.
- */
-int desired_position = 0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 90;
@@ -296,9 +291,9 @@ static void insertionSort(int arr[], int n) {
 */
 void read_time_and_sensor_inputs_callback() 
 {
-#define NUM_SAMPLES (32)
-#define TRIM_COUNT  (8)       // discard this many from each end
-#define MAX_RETRIES (30)
+#define NUM_SAMPLES (16)
+#define TRIM_COUNT  (4)       // discard this many from each end
+#define MAX_RETRIES (20)
   static int warnings = 0;
 
   int samples[NUM_SAMPLES];  // Array of
@@ -394,7 +389,8 @@ float pv_current(void)
   if (pv_current_val < 0) {
     pv_current_val = -pv_current_val;
   }
-  if (false) {
+  const bool debug_print = false;
+  if (debug_print) {
     static int cnt = 0 ;
     if (cnt++ < 10) {
       Serial.print(F("# raw=")); Serial.print(pv_current_sensor_raw); 
@@ -504,10 +500,12 @@ void emit_telemetry_callback(void)
 /*
      Check to see if the system has reached its high or low limits and stop the panels from moving if so.
 */
-void monitor_position_limits_callback() 
+void monitor_position_limits_callback()
 {
+  if (panels_going_up && (millis() - last_drive_panels_up_time) > 5000UL) {
+    stop_driving_panels(F("5s raise limit"));
+  }
   if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + position_hysteresis)) {
-
     stop_driving_panels(F("upper limit reached"));
   }
   if (panels_going_down) {
@@ -645,130 +643,36 @@ bool is_raining(void)
 
 #endif
 
-int panel_movement_start_hour(void);
-int panel_movement_end_hour(void);
-
-/*
-   Check to see if the sun angle sensor is showing that the sun has move to be higher in the sky and so the suns rays are no
-   longer normal to the panels (and sensor).  In this case, start raising the panels.
-
-   Also check to see if it is now night time and we should lower the panels to their resting (down) position and start them moving
-   down if that is so.
-*/
-
-int panel_movement_start_hour(void)
+void drive_panels_to_desired_position(void)
 {
-  time_t t = now();
-  int raise_hour = 8;          // Hour to start raising panels (default for winter)
+  static unsigned long low_pv_start_time = 0;
+  static bool was_pv_low = true;  // start true so dawn detection fires on first sunrise
 
-  switch (month(t)) {
-    case 11:
-    case 12:
-    case 1:
-      // Use defaults
-      break;
-
-    case 2:
-    case 10:
-      raise_hour = 9;
-      break;
-
-    default:
-      raise_hour = 11;
-      break;
-  }
-  return raise_hour;
-}
-
-int panel_movement_end_hour(void)
-{
-  int lower_hour = 17;         // Hour at which considering lowering panels, wait for dark to lower them
-
-  // Normally, I'd use data structures to define the times to raise and lower the panels.  However, our little Arduino processors has
-  // 7,000 bytes of instruction memory free, but only 310 bytes of data free.  I don't know how much of that free memory is used
-  // by the stack, but I don't think I can afford to make it any smaller.  So I am using a code-intensive approach in this function.
-
-  switch (month(now())) {
-    case 11:
-    case 12:
-    case 1:
-      // Use defaults
-      break;
-
-    case 2:
-    case 10:
-      lower_hour = 18;
-      break;
-
-    default:
-      lower_hour = 19;
-      break;
-  }
-  return lower_hour;
-}
-
-void drive_panels_to_desired_position(void) 
-{
-  time_t t = now();
-  int h = hour(t);
-  int raise_hour = panel_movement_start_hour();          // Hour to start raising panels (default for winter)
-  int top_position_hour = 10;  // Hour at which panels should be in top position
-  int lower_hour = panel_movement_end_hour();         // Hour at which considering lowering panels, wait for dark to lower them
-
-  // Normally, I'd use data structures to define the times to raise and lower the panels.  However, our little Arduino processors has
-  // 7,000 bytes of instruction memory free, but only 310 bytes of data free.  I don't know how much of that free memory is used
-  // by the stack, but I don't think I can afford to make it any smaller.  So I am using a code-intensive approach in this function.
-
-  switch (month(t)) {
-    case 11:
-    case 12:
-    case 1:
-      // Use defaults
-      break;
-
-    case 2:
-    case 10:
-      top_position_hour = 12;
-      break;
-
-    default:
-      top_position_hour = 13;
-      break;
-  }
-  
-  // If it is the right time of day to raise the panels, we haven't stalled too many times today, and it has
-  // been at least 30 minutes since the last time we raised the panels, then consider further raising them
   float pv = pv_current();
-  bool sufficient_delay_since_last_raise = (millis() - last_drive_panels_up_time) > 30 * 60 * 1000UL;
-  if (last_drive_panels_up_time == 0) {
-    sufficient_delay_since_last_raise = true; // Let them go up right after booting, to make testing faster
+  bool pv_is_low = (pv < 0.2);
+
+  // Dawn: when sun rises after a dark period and panels are down, reset daily stall count
+  if (was_pv_low && !pv_is_low && at_lower_position_limit) {
+    daily_stalls = 0;
   }
-  if (pv > 1.0 && raise_hour <= h && h < lower_hour && daily_stalls < 5 && sufficient_delay_since_last_raise) {
-    if (h >= top_position_hour) {
-      desired_position = calvals.position_upper_limit - 10;  // This should be redundant with check above
-    } else {
-      desired_position = (calvals.position_upper_limit - calvals.position_lower_limit) / (top_position_hour - h) + calvals.position_lower_limit;
-    }
-    if (desired_position > (position_sensor_val + 10 /* hysterisis */)) {
-      drive_panels_up();
+  was_pv_low = pv_is_low;
+
+  if (pv_is_low) {
+    if (low_pv_start_time == 0) {
+      low_pv_start_time = millis();
+    } else if ((millis() - low_pv_start_time) > 45UL * 60 * 1000) {
+      drive_panels_down(F("pv low 45 min"));
+      low_pv_start_time = 0;
     }
   } else {
-    if (false) {
-      static int cnt = 0; 
-      if (cnt++ < 10) {
-        Serial.print(h); Serial.print(" "); Serial.print(lower_hour); Serial.print(" "); Serial.println(pv_current());
-      }
+    low_pv_start_time = 0;
+    bool sufficient_delay = (millis() - last_drive_panels_up_time) > 30UL * 60 * 1000;
+    if (last_drive_panels_up_time == 0) {
+      sufficient_delay = true;
     }
-    if (h > lower_hour && pv < 0.2) {
-      drive_panels_down(F("time to lower panels and panel current low"));
+    if (daily_stalls < 5 && sufficient_delay && !at_upper_position_limit) {
+      drive_panels_up();
     }
-  }
-
-  // At midnight, reset the number of daily stalls
-  if (h == 0 && daily_stalls > 0) {
-    snprintf(cbuf, sizeof(cbuf), "#%3d", daily_stalls);
-    Serial.print(cbuf);
-    daily_stalls = 0;
   }
 }
 
@@ -783,9 +687,7 @@ void control_hydraulics_callback()
       break;
 
     case position_mode:
-      if (time_of_day_valid) {
-        drive_panels_to_desired_position();
-      }
+      drive_panels_to_desired_position();
       break;
 
     default:
