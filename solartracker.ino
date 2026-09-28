@@ -306,7 +306,7 @@ void read_time_and_sensor_inputs_callback()
       samples[i] = analogRead(DRAW_STRING_IN);
       delay(1); // Ensure that we take samples over more than one 60 Hz interval
       // If we have an out-of-range sample, sample again.
-      if (samples[i] > 40 && samples[i] < 470) {
+      if (samples[i] > 30 && samples[i] < 470) {
         break;
       } else {
         static unsigned bad_samples = 0;
