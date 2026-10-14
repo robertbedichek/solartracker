@@ -6,7 +6,7 @@ import subprocess
 import serial
 import errno
 
-DEVICE = "/dev/tty.usbserial-11440"
+DEVICE = "/dev/tty.usbserial-1440"
 SCRIPT = os.path.expanduser('~/bin/gobble_solartracker.py')
 CHECK_INTERVAL = 60  # seconds
 
