@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""trackctl: build, load and talk to the ESP32 solar tracker controller.
+
+  trackctl build              compile solartracker_esp32 (writes secrets.h first if needed)
+  trackctl flash [PORT]       load over USB-C
+  trackctl update             build, then load over the network; the controller restarts into it
+  trackctl status             the controller's state (JSON; the page at http://solartracker/ shows it)
+  trackctl log [-f] [BYTES]   recent output; -f keeps following it
+  trackctl mode off|track     off: never moves by itself; track: normal (saved in flash)
+  trackctl up | down | stop   one lift (5 s at most, all limits apply), let the panels down, stop both outputs
+  trackctl cal [down|up|clear] tilt calibration: down with the panels resting at the bottom, then up at the
+                              top stop (saved in flash); plain `cal` shows it
+  trackctl upload on|off      stream telemetry to bedichek.org (kept across restarts)
+  trackctl telemetry | reboot
+
+The controller is http://solartracker, 192.168.1.8, an 8DO board (TRACKCTL_HOST overrides the address
+commands go to; `update` always waits for the new firmware at 192.168.1.8).  `update` refuses any board
+whose /status doesn't say "board": "8DO": on an 8RO this firmware's "all off" would turn every relay on.
+For the first load onto the spare 8DO (still running the pool firmware at .7):
+    TRACKCTL_HOST=192.168.1.7 trackctl update
+which sends the pool controller's LAN token if the board refuses ours.  The tokens live in
+~/.config/trackctl/ (lan_token, ingest_token), are made on first use and compiled in; never print them.
+"""
+
+import glob
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKETCH = os.path.join(HERE, "solartracker_esp32")
+BUILD = os.path.join(HERE, "build")
+FQBN = ("esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,"
+        "PSRAM=opi,CDCOnBoot=cdc")
+HOST = os.environ.get("TRACKCTL_HOST", "192.168.1.8")
+FIRMWARE_HOST = "192.168.1.8"   # Where the new firmware answers
+CONF = os.path.expanduser("~/.config/trackctl")
+POOL_CONF = os.path.expanduser("~/.config/poolctl")   # The pool firmware still on the spare board checks this one
+
+
+
+def token(name, conf=None):
+    conf = conf or CONF
+    path = os.path.join(conf, name)
+    if not os.path.exists(path):
+        os.makedirs(conf, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(24) + "\n")
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write_secrets():
+    text = ("// Written by trackctl from ~/.config/trackctl; not in git\n"
+            f'#define TRACKER_LAN_TOKEN "{token("lan_token")}"\n'
+            f'#define TRACKER_INGEST_TOKEN "{token("ingest_token")}"\n')
+    path = os.path.join(SKETCH, "secrets.h")
+    old = open(path).read() if os.path.exists(path) else None
+    if old != text:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+
+
+def build():
+    write_secrets()
+    r = subprocess.run(["arduino-cli", "compile", "--fqbn", FQBN, "--output-dir", BUILD,
+                        "--warnings", "default", SKETCH])
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    return os.path.join(BUILD, "solartracker_esp32.ino.bin")
+
+
+def request(path, data=None, timeout=10, headers=None, tok=None):
+    req = urllib.request.Request(f"http://{HOST}{path}", data=data, headers=headers or {})
+    if data is not None:
+        req.add_header("X-Token", tok or token("lan_token"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 403 and tok is None and data is not None and path == "/update" and os.path.exists(os.path.join(POOL_CONF, "lan_token")):
+            print("trackctl: refused; the board still runs the pool firmware, sending the pool controller's token")
+            return request(path, data, timeout, headers, token("lan_token", POOL_CONF))
+        sys.exit(f"trackctl: {e.code} {e.read().decode(errors='replace').strip()}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        sys.exit(f"trackctl: can't reach {HOST}: {e}")
+
+
+def command(text):
+    sys.stdout.write(request("/cmd", text.encode(), headers={"Content-Type": "text/plain"}))
+
+
+def update():
+    if '"board": "8DO"' not in request("/status"):
+        sys.exit(f"trackctl: {HOST} doesn't report an 8DO board; this firmware would turn every relay on on an 8RO")
+    binary = build()
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"firmware\"; "
+            f"filename=\"solartracker_esp32.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            ).encode() + open(binary, "rb").read() + f"\r\n--{boundary}--\r\n".encode()
+    print(f"trackctl: sending {len(body) // 1024} KB to {HOST}")
+    print(request("/update", body, timeout=120,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}).strip())
+    print(f"trackctl: waiting for it at {FIRMWARE_HOST}")
+    for _ in range(30):
+        time.sleep(3)
+        try:
+            with urllib.request.urlopen(f"http://{FIRMWARE_HOST}/status", timeout=3) as r:
+                print(r.read().decode())
+                print("trackctl: it marks the new firmware good after a minute (firmware_verified)")
+                return
+        except OSError:
+            pass
+    sys.exit(f"trackctl: no answer from {FIRMWARE_HOST} after 90 s; it goes back to the old firmware by itself")
+
+
+def flash(port):
+    binary = build()
+    if port is None:
+        ports = glob.glob("/dev/cu.usbmodem*")
+        if len(ports) != 1:
+            sys.exit(f"trackctl: give the port; found {ports or 'none'}")
+        port = ports[0]
+    r = subprocess.run(["arduino-cli", "upload", "--fqbn", FQBN, "--input-dir", BUILD, "-p", port, SKETCH])
+    sys.exit(r.returncode)
+
+
+def log(args):
+    follow = "-f" in args
+    args = [a for a in args if a != "-f"]
+    nbytes = args[0] if args else "8000"
+    text = request(f"/log?bytes={nbytes}")
+    sys.stdout.write(text)
+    while follow:
+        time.sleep(2)
+        new = request("/log?bytes=8000")
+        # Print what follows the last line we have seen
+        tail = text.splitlines()[-1] if text else ""
+        idx = new.rfind(tail) if tail else -1
+        part = new[idx + len(tail) + 1:] if idx >= 0 else new
+        sys.stdout.write(part)
+        sys.stdout.flush()
+        if part:
+            text = new
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = args[0]
+    if cmd == "build":
+        print(build())
+    elif cmd == "flash":
+        flash(args[1] if len(args) > 1 else None)
+    elif cmd == "update":
+        update()
+    elif cmd == "status":
+        sys.stdout.write(request("/status"))
+    elif cmd == "log":
+        log(args[1:])
+    elif cmd == "mode" and len(args) == 2 and args[1] in ("off", "track"):
+        command(f"mode {args[1]}")
+    elif cmd == "upload" and len(args) == 2 and args[1] in ("on", "off"):
+        command(f"upload {args[1]}")
+    elif cmd == "cal" and len(args) <= 2 and (len(args) == 1 or args[1] in ("down", "up", "clear")):
+        command(" ".join(args))
+    elif cmd in ("up", "down", "stop", "telemetry", "reboot"):
+        command(cmd)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
