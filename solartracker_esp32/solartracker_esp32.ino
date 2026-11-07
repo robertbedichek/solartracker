@@ -13,6 +13,7 @@
      each SSR's + input high with its - input grounded; here the SSR's + goes to the supply and its - to the DO
      terminal.  A manual override switch from the SSR's - to ground still works alongside.
    - DI1 is the "lower panels" switch (dry contact between DI1 and DGND, not the terminal printed COM).
+   - The pendant: DI7 DOWN (red), DI8 UP (black), common (orange) to DGND.  See pendant_callback.
    - The inclinometer replaces the draw-wire sensor: the panel position is the tilt in degrees above the
      lowered (rest) position, on whichever of its axes the panels tilt about.  "cal down" (panels resting at the
      bottom) and "cal up" (panels at the top stop) measure it on the frame, and the Arduino's limits, which were
@@ -88,6 +89,8 @@ bool time_valid = false;
 #define DI1_PIN          (4)      // DI1..DI8 are GPIO4..GPIO11, low when the input is active
 
 #define LOWER_PANEL_REQUEST_INPUT_PIN (DI1_PIN)  // When closed, we turn on the solenoid and let the panels fall
+#define PENDANT_DOWN_PIN (DI1_PIN + 6)            // DI7, pendant DOWN button (red wire); common (orange) to DGND
+#define PENDANT_UP_PIN   (DI1_PIN + 7)            // DI8, pendant UP button (black wire)
 
 #define MOTOR_PS_OUTPUT     (1)   // DO1: SSR that powers the 9 V / 100 A supply wired straight to the hydraulic motor
 #define SOLENOID_PS_OUTPUT  (2)   // DO2: SSR that powers the check-valve solenoid, which lets the panels down
@@ -157,8 +160,9 @@ struct Tilt_Cal {
   int axis;              // 0 roll, 1 pitch
   float down;            // That axis's angle with the panels resting at the bottom
   float travel;          // Degrees from rest to the top stop, signed by the axis's direction
-  bool have_down;        // "cal down" done since boot (needed before "cal up")
-  float down_angles[2];  // Both axes' angles at "cal down"
+  bool have_down, have_up;   // "cal down" / "cal up" recorded since boot; either order
+  float down_angles[2];      // Both axes' angles at "cal down"
+  float up_angles[2];        // Both axes' angles at "cal up"
 } tcal;
 
 const char *axis_names[] = {"roll", "pitch"};
@@ -194,6 +198,21 @@ const char *fail_reason = "";
 
 bool panels_going_up = false;
 bool panels_going_down = false;
+
+// Pendant.  UP runs the motor supply while held (60 s at most, over-current stop, and the top limit switch still
+// cuts the motor).  DOWN, once calibrated, lets the panels down until the lower limit (as drive_panels_down).  Before
+// calibration it runs the same solenoid cycle (30 min on, 45 off; the panels take 1-8 hours to fall) until a 30-min on
+// period moves the tilt less than 0.5 deg (the panels are resting), 8 AM, or 12 hours.  A second DOWN press, UP, or
+// both buttons stop lowering.
+bool pendant_up, pendant_down;               // Debounced button states
+bool pendant_raising;                        // Motor on because UP is held
+bool pendant_lowering;                       // Lowering from a DOWN press before calibration (latched)
+unsigned long pendant_since;                 // millis() when the current pendant move began
+const unsigned long pendant_up_max = 60 * 1000UL;
+const unsigned long pendant_down_max = 12 * 3600 * 1000UL;
+const float pendant_rest_deg = 0.5;          // Less tilt change than this in a 30-min solenoid-on period = resting
+float pendant_on_angles[2];                  // Tilt when the current solenoid-on period began
+bool pendant_on_angles_valid;
 bool motor_power_supply_is_on = false;
 bool solenoid_power_supply_is_on = false;
 
@@ -213,6 +232,8 @@ void check_outputs_callback(void);
 Task check_outputs(TASK_SECOND * 10, TASK_FOREVER, &check_outputs_callback, &ts, true);
 void sync_rtc_callback(void);
 Task sync_rtc(TASK_SECOND, TASK_FOREVER, &sync_rtc_callback, &ts, true);
+void pendant_callback(void);
+Task pendant(50, TASK_FOREVER, &pendant_callback, &ts, true);
 void solenoid_test_callback(void);
 Task solenoid_test(TASK_SECOND, TASK_FOREVER, &solenoid_test_callback, &ts, false);
 unsigned long solenoid_test_until;
@@ -635,11 +656,19 @@ void load_calibration(void)
   if (fabsf(tcal.travel) < 10) {
     tcal.valid = false;
   }
+  prefs.begin("tracker", true);
+  tcal.have_down = prefs.getBool("half_dn", false);
+  tcal.down_angles[0] = prefs.getFloat("half_dn0", 0);
+  tcal.down_angles[1] = prefs.getFloat("half_dn1", 0);
+  tcal.have_up = prefs.getBool("half_up", false);
+  tcal.up_angles[0] = prefs.getFloat("half_up0", 0);
+  tcal.up_angles[1] = prefs.getFloat("half_up1", 0);
+  prefs.end();
   apply_calibration();
 }
 
-// "cal down": the panels are resting at the bottom.  "cal up": they are at the top stop; the axis that moved
-// most is the tilt axis.  "cal clear" forgets it (nothing moves until it is done again).  "cal" reports it.
+// "cal down": the panels are resting at the bottom.  "cal up": they are at the top stop.  Either order; once both are
+// recorded (since boot), the axis that moved most is the tilt axis.  "cal clear" forgets it (nothing moves until it is done again).  "cal" reports it.
 void calibrate(const char *what)
 {
   float a[2];
@@ -653,25 +682,41 @@ void calibrate(const char *what)
   } else if (strcmp(what, "clear") == 0) {
     stop_driving_panels("cal clear");
     tcal.valid = false;
-    tcal.have_down = false;
+    tcal.have_down = tcal.have_up = false;
     save_calibration();
+    {
+      Preferences prefs;
+      prefs.begin("tracker", false);
+      prefs.putBool("half_dn", false);
+      prefs.putBool("half_up", false);
+      prefs.end();
+    }
     out.println(F("# calibration cleared; the panels won't move until 'cal down' and 'cal up'"));
   } else if (!incl_angles(a)) {
     out.println(F("# inclinometer not answering"));
-  } else if (strcmp(what, "down") == 0) {
-    tcal.down_angles[0] = a[0];
-    tcal.down_angles[1] = a[1];
-    tcal.have_down = true;
-    out.printf("# rest position: roll %.2f, pitch %.2f; now 'cal up' with the panels at the top stop\n", a[0], a[1]);
-  } else if (strcmp(what, "up") == 0) {
-    if (!tcal.have_down) {
-      out.println(F("# 'cal down' first"));
+  } else if (strcmp(what, "down") == 0 || strcmp(what, "up") == 0) {
+    bool down = what[0] == 'd';
+    float *dst = down ? tcal.down_angles : tcal.up_angles;
+    dst[0] = a[0];
+    dst[1] = a[1];
+    (down ? tcal.have_down : tcal.have_up) = true;
+    {
+      Preferences prefs;      // Kept until calibration completes, so a restart in between doesn't lose it
+      prefs.begin("tracker", false);
+      prefs.putBool(down ? "half_dn" : "half_up", true);
+      prefs.putFloat(down ? "half_dn0" : "half_up0", a[0]);
+      prefs.putFloat(down ? "half_dn1" : "half_up1", a[1]);
+      prefs.end();
+    }
+    out.printf("# %s position: roll %.2f, pitch %.2f\n", down ? "rest" : "top stop", a[0], a[1]);
+    if (!(tcal.have_down && tcal.have_up)) {
+      out.println(down ? F("# now 'cal up' with the panels at the top stop") : F("# now 'cal down' with the panels resting at the bottom"));
       return;
     }
-    float d[2] = {wrap180(a[0] - tcal.down_angles[0]), wrap180(a[1] - tcal.down_angles[1])};
+    float d[2] = {wrap180(tcal.up_angles[0] - tcal.down_angles[0]), wrap180(tcal.up_angles[1] - tcal.down_angles[1])};
     int axis = fabsf(d[1]) > fabsf(d[0]) ? 1 : 0;
     if (fabsf(d[axis]) < 10) {
-      out.printf("# only %.2f deg roll and %.2f deg pitch from rest; are the panels at the top stop?\n", d[0], d[1]);
+      out.printf("# only %.2f deg roll and %.2f deg pitch between rest and top; not calibrated\n", d[0], d[1]);
       return;
     }
     stop_driving_panels("calibration");
@@ -756,6 +801,8 @@ void stop_driving_panels(const char *who_called)
   }
   panels_going_down = false;
   panels_going_up = false;
+  pendant_raising = false;
+  pendant_lowering = false;
 
   monitor_position_limits.disable();
   monitor_stall_and_motor_current.disable();
@@ -1130,7 +1177,7 @@ void drive_panels_to_desired_position(void)
 
 void control_hydraulics_callback()
 {
-  if (failed || !analog_ok() || !position_known()) {
+  if (failed || !analog_ok() || !position_known() || pendant_raising || pendant_lowering || pendant_up || pendant_down) {
     return;
   }
   if (!panels_going_up && !panels_going_down) {
@@ -1591,6 +1638,9 @@ void handle_status(void)
   s += "  \"going_up\": " + String(panels_going_up) + ", \"going_down\": " + String(panels_going_down) +
        ", \"motor\": " + String(motor_power_supply_is_on) + ", \"solenoid\": " + String(solenoid_power_supply_is_on) +
        ", \"outputs\": \"0x" + String(outputs ? outputs->all() : 0, HEX) + "\",\n";
+  s += "  \"pendant_up\": " + String(pendant_up) + ", \"pendant_down\": " + String(pendant_down) +
+       ", \"pendant_raising\": " + String(pendant_raising) + ", \"pendant_lowering\": " + String(pendant_lowering) +
+       ", \"cal_have_up\": " + String(tcal.have_up) + ", \"cal_have_down\": " + String(tcal.have_down) + ",\n";
   s += "  \"lower_request\": " + String(lower_panel_request) + ", \"daily_stalls\": " + String(daily_stalls) + ",\n";
   s += "  \"motor_amps\": " + String(motor_amps()) + ", \"pv_amps\": " + f(pv_current(), 2) +
        ", \"motor_zero_mv\": " + f(motor_zero_mv, 0) + ", \"pv_zero_mv\": " + f(pv_zero_mv, 0) + ",\n";
@@ -1849,6 +1899,117 @@ void motor_test_callback(void)
     if (!panels_going_up) {
       turn_off_motor_power_supply();
       out.println(F("# motor test over, DO1 off"));
+    }
+  }
+}
+
+void pendant_callback(void)
+{
+  static uint8_t up_count, down_count;     // Consecutive 50 ms polls with the button closed
+  up_count = digitalRead(PENDANT_UP_PIN) == LOW ? (up_count < 3 ? up_count + 1 : 3) : 0;
+  down_count = digitalRead(PENDANT_DOWN_PIN) == LOW ? (down_count < 3 ? down_count + 1 : 3) : 0;
+  bool up = up_count >= 2, down = down_count >= 2;       // 100 ms debounce
+  // A button closed at power-up (held, stuck or shorted) is ignored until it has been seen released
+  static bool up_armed, down_armed;
+  if (!up) up_armed = true;
+  if (!down) down_armed = true;
+  bool up_pressed = up && !pendant_up && up_armed, down_pressed = down && !pendant_down && down_armed;
+  bool up_released = !up && pendant_up;
+  pendant_up = up;
+  pendant_down = down;
+
+  if (up && down) {
+    if (up_pressed || down_pressed) {
+      motor_test.disable();
+      solenoid_test.disable();
+      stop_driving_panels("pendant: both buttons");
+    }
+    return;
+  }
+
+  if (up_pressed) {
+    motor_test.disable();
+    solenoid_test.disable();
+    if (panels_going_up || panels_going_down || solenoid_power_supply_is_on || motor_power_supply_is_on) {
+      stop_driving_panels("pendant UP");
+    }
+    turn_on_motor_power_supply();
+    pendant_raising = true;
+    pendant_since = millis();
+    force_telemetry++;
+    out.println(F("# pendant UP: motor on while held"));
+  } else if (up_released && pendant_raising) {
+    turn_off_motor_power_supply();
+    pendant_raising = false;
+    force_telemetry++;
+    out.printf("# pendant UP released after %.1f s\n", (millis() - pendant_since) / 1000.0);
+  } else if (pendant_raising) {
+    if (millis() - pendant_since > pendant_up_max) {
+      stop_driving_panels("pendant UP held 60 s");
+      out.println(F("# alert pendant UP held for 60 s; motor off until it is released and pressed again"));
+    } else if (analog_ok() && motor_amps() > (int)motor_current_threshold_high) {
+      stop_driving_panels("pendant UP: high motor current");
+      out.printf("# alert high motor current on pendant UP: %d A\n", motor_amps());
+    }
+  }
+
+  if (down_pressed && (panels_going_down || pendant_lowering)) {
+    stop_driving_panels("pendant DOWN again");
+    out.println(F("# pendant DOWN pressed again: lowering stopped"));
+    force_telemetry++;
+  } else if (down_pressed) {
+    motor_test.disable();
+    solenoid_test.disable();
+    if (panels_going_up || motor_power_supply_is_on) {
+      stop_driving_panels("pendant DOWN");
+    }
+    force_telemetry++;
+    if (position_known()) {
+      if (failed) {
+        out.printf("# pendant DOWN: failed (%s); reboot first\n", fail_reason);
+      } else if (at_lower_position_limit) {
+        out.println(F("# pendant DOWN: already at the lower limit"));
+      } else {
+        drive_panels_down("pendant");
+      }
+    } else {
+      turn_on_solenoid_power_supply();
+      pendant_lowering = true;
+      pendant_since = millis();
+      pendant_on_angles_valid = incl_angles(pendant_on_angles);
+      out.println(F("# pendant DOWN (not calibrated): lowering, solenoid 30 min on / 45 off until the panels rest"));
+    }
+  } else if (pendant_lowering) {
+    static unsigned long last_check;
+    if (millis() - last_check >= 1000) {
+      last_check = millis();
+      float a[2];
+      bool have = incl_angles(a);
+      if (hour(now()) == 8) {
+        stop_driving_panels("pendant DOWN: 8 AM");
+      } else if (millis() - pendant_since > pendant_down_max) {
+        stop_driving_panels("pendant DOWN: 12 hours");
+      } else if (solenoid_power_supply_is_on && millis() - solenoid_power_supply_on_off_time > max_solenoid_on_time) {
+        bool resting = have && pendant_on_angles_valid &&
+                       fabsf(wrap180(a[0] - pendant_on_angles[0])) < pendant_rest_deg &&
+                       fabsf(wrap180(a[1] - pendant_on_angles[1])) < pendant_rest_deg;
+        if (resting) {
+          stop_driving_panels("pendant DOWN: panels resting");
+          out.printf("# alert panels resting (roll %.2f, pitch %.2f) after %.1f h; run 'cal down' if they are fully down\n",
+                     a[0], a[1], (millis() - pendant_since) / 3600000.0);
+        } else {
+          turn_off_solenoid_power_supply();     // Rest the solenoid, as drive_panels_down does
+          force_telemetry++;
+        }
+      } else if (!solenoid_power_supply_is_on && millis() - solenoid_power_supply_on_off_time > max_solenoid_off_time) {
+        turn_on_solenoid_power_supply();
+        pendant_on_angles_valid = have;
+        if (have) {
+          pendant_on_angles[0] = a[0];
+          pendant_on_angles[1] = a[1];
+        }
+        force_telemetry++;
+      }
     }
   }
 }
