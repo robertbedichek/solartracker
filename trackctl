@@ -12,6 +12,7 @@
                               top stop (saved in flash); plain `cal` shows it
   trackctl motor on|off       DO1 on for at most 5 s (the motor supply), for wiring checks
   trackctl solenoid on|off    DO2 on for at most 60 s, for wiring checks
+  trackctl zero [motor|pv]    record a current sensor's no-current reading (motor off; PV at night), saved
   trackctl upload on|off      stream telemetry to bedichek.org (kept across restarts)
   trackctl telemetry | reboot
 
@@ -177,6 +178,8 @@ def main():
         command(" ".join(args))
     elif cmd in ("motor", "solenoid") and len(args) == 2 and args[1] in ("on", "off"):
         command(f"{cmd} {args[1]}")
+    elif cmd == "zero" and len(args) <= 2 and (len(args) == 1 or args[1] in ("motor", "pv")):
+        command(" ".join(args))
     elif cmd in ("up", "down", "stop", "telemetry", "reboot"):
         command(cmd)
     else:

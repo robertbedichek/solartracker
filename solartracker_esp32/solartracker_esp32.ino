@@ -173,7 +173,13 @@ bool at_upper_position_limit = false, at_lower_position_limit = false;
 float position_sensor_val;                // Degrees above the rest position (inclinometer)
 float pv_current(void);                   // Amps flowing past Hall Effect current sensor clamped to a solar panel DC cable
 float peak_pv_current;                    // Highest recorded PV current during last panel raise
-float minimum_pv_current_measured = 100.0;
+
+// Each Hall sensor's output with no current flowing, in mV.  Measured with "zero motor" / "zero pv" and saved in
+// flash; until then the sensors' nominal half-supply 2,500 mV.  (The Arduino subtracted the motor reading taken while
+// the motor was off, and the lowest PV current seen since boot, which reads 0 A all day after a daytime restart.)
+#define NOMINAL_ZERO_MV (2500.0)
+float motor_zero_mv = NOMINAL_ZERO_MV;
+float pv_zero_mv = NOMINAL_ZERO_MV;
 
 bool position_fresh;                      // The inclinometer answered at the last read; else position_sensor_val is the last known
 float last_position_sensor_val;           // Position value at last call to status print
@@ -537,7 +543,6 @@ bool analog_ok(void)
   return bus.count > 0 && bus.analog_failures < 10;   // 1 s
 }
 
-static int mv_to_counts(int mv) { return (mv * 1023L + 2500) / 5000; }
 
 Incl inclinometer(void)
 {
@@ -862,7 +867,7 @@ int motor_amps(void)
   if (n == 0 || !analog_ok()) {
     return 0;      // "analog module not answering" has been reported
   }
-  int motor_current_sense_millivolts = 0;
+  float motor_current_sense_millivolts = 0;
   int samples = 0;
   for (int i = 0; i < n; i++) {
     if (r[i] > 0 && r[i] < 5000) {
@@ -879,17 +884,8 @@ int motor_amps(void)
   }
   motor_current_sense_millivolts /= samples;
 
-  // The Hall Effect current sensor outputs a signal that is nominally 2.5 +/- 2V, 20 mV per amp.  The clamp
-  // could be on either way round, so take the absolute value of the difference from 2.5 V.
-  float motor_current_val = (2500.0 - motor_current_sense_millivolts) / 20.0;
-  if (motor_current_val < 0) {
-    motor_current_val = -motor_current_val;
-  }
-  float motor_current_offset = 0.0;
-  if (motor_power_supply_is_on == false) {
-    motor_current_offset = motor_current_val;
-  }
-  return motor_current_val - motor_current_offset;
+  // 20 mV per amp either side of the sensor's zero; the clamp could be on either way round, so take the magnitude.
+  return (int)(fabsf(motor_current_sense_millivolts - motor_zero_mv) / 20.0 + 0.5);
 }
 
 // Return the number of amps that one of the panels is producing.  We use this to help determine
@@ -905,18 +901,8 @@ float pv_current(void)
   for (int i = 0; i < n; i++) {
     sum += r[i];
   }
-  // Rounded to the Arduino's 10-bit steps (4.9 mV), so the 0.1 A peak test sees the same resolution
-  float pv_current_sensor_millivolts = mv_to_counts(sum / n) * 5000.0 / 1023.0;
-
-  // 2.5 V nominal at 0 A, 200 mV per amp, either direction (see motor_amps)
-  float pv_current_val = (2476.4 - pv_current_sensor_millivolts) / 200.0;
-  if (pv_current_val < 0) {
-    pv_current_val = -pv_current_val;
-  }
-  if (pv_current_val < minimum_pv_current_measured) {
-    minimum_pv_current_measured = pv_current_val;
-  }
-  return pv_current_val - minimum_pv_current_measured;
+  // 200 mV per amp either side of the sensor's zero, either direction (see motor_amps)
+  return fabsf(sum / n - pv_zero_mv) / 200.0;
 }
 
 /*
@@ -1173,6 +1159,7 @@ void control_hydraulics_callback()
 //   up                   one lift, with all the usual limits (5 s at most)
 //   down                 let the panels down (solenoid), until the lower limit or 8 AM
 //   stop                 both outputs off now
+//   zero [motor|pv]      record a current sensor's no-current output (motor off / PV at night), saved in flash
 //   motor on|off         DO1 on for at most 5 s, for wiring checks (not while moving or with the solenoid on)
 //   solenoid on|off      DO2 on for at most 60 s, for wiring checks (not while the panels are moving)
 //   cal [down|up|clear]  tilt calibration: rest position, then the top stop (saved in flash)
@@ -1186,6 +1173,43 @@ void save_pref_bool(const char *key, bool v)
   prefs.begin("tracker", false);
   prefs.putBool(key, v);
   prefs.end();
+}
+
+// "zero motor" / "zero pv": record a Hall sensor's no-current output (mean of its last 8 readings) and save it.
+// Motor: with the motor off.  PV: at night, or with the clamp off the cable.  "zero" shows both.
+void set_zero(const char *which)
+{
+  bool motor = strcmp(which, "motor") == 0, pv = strcmp(which, "pv") == 0;
+  if (!motor && !pv) {
+    out.printf("# zeros: motor %.0f mV, pv %.0f mV ('zero motor' with the motor off, 'zero pv' at night)\n",
+               motor_zero_mv, pv_zero_mv);
+    return;
+  }
+  if (motor && motor_power_supply_is_on) {
+    out.println(F("# motor is on; zero it with the motor off"));
+    return;
+  }
+  int r[RING];
+  int n = channel_readings(motor ? MOTOR_CURRENT_CHANNEL : PV_CURRENT_CHANNEL, RING, r);
+  if (n < RING || !analog_ok()) {
+    out.println(F("# analog module not answering"));
+    return;
+  }
+  float sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += r[i];
+  }
+  float mv = sum / n;
+  if (fabsf(mv - NOMINAL_ZERO_MV) > 300) {
+    out.printf("# %.0f mV is too far from 2,500 mV for a zero; is current flowing?\n", mv);
+    return;
+  }
+  (motor ? motor_zero_mv : pv_zero_mv) = mv;
+  Preferences prefs;
+  prefs.begin("tracker", false);
+  prefs.putFloat(motor ? "zero_motor" : "zero_pv", mv);
+  prefs.end();
+  out.printf("# %s zero now %.0f mV (saved)\n", motor ? "motor" : "pv", mv);
 }
 
 void run_command(const char *command)
@@ -1259,6 +1283,8 @@ void run_command(const char *command)
     solenoid_test.disable();
     turn_off_solenoid_power_supply();
     out.println(F("# solenoid (DO2) off"));
+  } else if (strcmp(command, "zero") == 0 || strncmp(command, "zero ", 5) == 0) {
+    set_zero(command[4] ? command + 5 : "");
   } else if (strcmp(command, "stop") == 0) {
     stop_driving_panels("command");
   } else if (strcmp(command, "telemetry") == 0) {
@@ -1274,7 +1300,7 @@ void run_command(const char *command)
     ESP.restart();
   } else {
     out.printf("# Unknown command: %s\n", command);
-    out.println(F("# choices are: 'mode off|track', up, down, stop, 'motor on|off', 'solenoid on|off', 'cal [down|up|clear]', telemetry, 'upload on|off', reboot"));
+    out.println(F("# choices are: 'mode off|track', up, down, stop, 'motor on|off', 'solenoid on|off', 'zero [motor|pv]', 'cal [down|up|clear]', telemetry, 'upload on|off', reboot"));
   }
 }
 
@@ -1567,7 +1593,7 @@ void handle_status(void)
        ", \"outputs\": \"0x" + String(outputs ? outputs->all() : 0, HEX) + "\",\n";
   s += "  \"lower_request\": " + String(lower_panel_request) + ", \"daily_stalls\": " + String(daily_stalls) + ",\n";
   s += "  \"motor_amps\": " + String(motor_amps()) + ", \"pv_amps\": " + f(pv_current(), 2) +
-       ", \"pv_min_amps\": " + f(minimum_pv_current_measured, 2) + ",\n";
+       ", \"motor_zero_mv\": " + f(motor_zero_mv, 0) + ", \"pv_zero_mv\": " + f(pv_zero_mv, 0) + ",\n";
   s += "  \"analog_module\": " + String(analog_ok() ? "true" : "false") + ", \"analog_mv\": [" + String(mv[0]) + ", " +
        String(mv[1]) + "],\n";
   s += "  \"inclinometer\": " + String(incl.ok ? "true" : "false") + ", \"incl_reads\": " + String(incl_reads) +
@@ -1656,7 +1682,7 @@ async function tick() {
       `<tr><td>|g|</td><td>${n(Math.hypot(...s.acc_g), 3)}</td><td></td><td></td></tr>`;
     $("io").innerHTML =
       row("Analog module", yes(s.analog_module)) + row("Motor current (CH1)", `${s.motor_amps} A  (${s.analog_mv[0]} mV)`) +
-      row("PV current (CH2)", `${n(s.pv_amps, 2)} A  (${s.analog_mv[1]} mV)`) + row("PV minimum seen", n(s.pv_min_amps, 2) + " A") +
+      row("PV current (CH2)", `${n(s.pv_amps, 2)} A  (${s.analog_mv[1]} mV)`) + row("Zeros (motor / PV)", `${n(s.motor_zero_mv, 0)} / ${n(s.pv_zero_mv, 0)} mV`) +
       row("Lower-panels switch (DI1)", s.lower_request ? "closed" : "open");
     $("ctl").innerHTML =
       row("Output expander", yes(s.relay_board)) + row("Outputs", s.outputs) + row("Clock set", yes(s.time_valid)) +
@@ -1897,6 +1923,8 @@ void setup(void)
   prefs.begin("tracker", true);
   upload_enabled = prefs.getBool("upload", false);
   calvals.operation_mode = prefs.getBool("track", true) ? position_mode : no_panel_movement_mode;
+  motor_zero_mv = prefs.getFloat("zero_motor", NOMINAL_ZERO_MV);
+  pv_zero_mv = prefs.getFloat("zero_pv", NOMINAL_ZERO_MV);
   prefs.end();
 
   setup_reset_cause();
