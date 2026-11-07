@@ -207,6 +207,12 @@ void check_outputs_callback(void);
 Task check_outputs(TASK_SECOND * 10, TASK_FOREVER, &check_outputs_callback, &ts, true);
 void sync_rtc_callback(void);
 Task sync_rtc(TASK_SECOND, TASK_FOREVER, &sync_rtc_callback, &ts, true);
+void solenoid_test_callback(void);
+Task solenoid_test(TASK_SECOND, TASK_FOREVER, &solenoid_test_callback, &ts, false);
+unsigned long solenoid_test_until;
+void motor_test_callback(void);
+Task motor_test(100, TASK_FOREVER, &motor_test_callback, &ts, false);
+unsigned long motor_test_until;        // "motor on" from trackctl: DO1 on for at most 5 s (a lift's limit), for wiring checks     // "solenoid on" from trackctl: DO2 on for a limited time, for wiring checks
 void mark_firmware_good_callback(void);
 Task mark_firmware_good(TASK_SECOND * 60, TASK_ONCE, &mark_firmware_good_callback, &ts, false);
 
@@ -1167,6 +1173,8 @@ void control_hydraulics_callback()
 //   up                   one lift, with all the usual limits (5 s at most)
 //   down                 let the panels down (solenoid), until the lower limit or 8 AM
 //   stop                 both outputs off now
+//   motor on|off         DO1 on for at most 5 s, for wiring checks (not while moving or with the solenoid on)
+//   solenoid on|off      DO2 on for at most 60 s, for wiring checks (not while the panels are moving)
 //   cal [down|up|clear]  tilt calibration: rest position, then the top stop (saved in flash)
 //   telemetry            emit a telemetry line now
 //   upload on|off        send telemetry to bedichek.org or not (saved in flash)
@@ -1225,6 +1233,32 @@ void run_command(const char *command)
     }
   } else if (strcmp(command, "cal") == 0 || strncmp(command, "cal ", 4) == 0) {
     calibrate(command[3] ? command + 4 : "");
+  } else if (strcmp(command, "solenoid on") == 0) {
+    if (panels_going_up || panels_going_down) {
+      out.println(F("# panels moving; stop first"));
+    } else {
+      turn_on_solenoid_power_supply();
+      solenoid_test_until = millis() + 60 * 1000UL;
+      solenoid_test.enable();
+      out.println(F("# solenoid (DO2) on for 60 s, test"));
+    }
+  } else if (strcmp(command, "motor on") == 0) {
+    if (panels_going_up || panels_going_down || solenoid_power_supply_is_on) {
+      out.println(F("# panels moving or solenoid on; stop first"));
+    } else {
+      turn_on_motor_power_supply();
+      motor_test_until = millis() + 5 * 1000UL;
+      motor_test.enable();
+      out.println(F("# motor supply (DO1) on for 5 s, test"));
+    }
+  } else if (strcmp(command, "motor off") == 0) {
+    motor_test.disable();
+    turn_off_motor_power_supply();
+    out.println(F("# motor supply (DO1) off"));
+  } else if (strcmp(command, "solenoid off") == 0) {
+    solenoid_test.disable();
+    turn_off_solenoid_power_supply();
+    out.println(F("# solenoid (DO2) off"));
   } else if (strcmp(command, "stop") == 0) {
     stop_driving_panels("command");
   } else if (strcmp(command, "telemetry") == 0) {
@@ -1240,7 +1274,7 @@ void run_command(const char *command)
     ESP.restart();
   } else {
     out.printf("# Unknown command: %s\n", command);
-    out.println(F("# choices are: 'mode off|track', up, down, stop, 'cal [down|up|clear]', telemetry, 'upload on|off', reboot"));
+    out.println(F("# choices are: 'mode off|track', up, down, stop, 'motor on|off', 'solenoid on|off', 'cal [down|up|clear]', telemetry, 'upload on|off', reboot"));
   }
 }
 
@@ -1780,6 +1814,28 @@ void upload_task(void *arg)
 extern "C" bool verifyRollbackLater()   // C linkage, or the core keeps its own version, which marks every image good
 {
   return true;
+}
+
+void motor_test_callback(void)
+{
+  if ((long)(millis() - motor_test_until) >= 0) {
+    motor_test.disable();
+    if (!panels_going_up) {
+      turn_off_motor_power_supply();
+      out.println(F("# motor test over, DO1 off"));
+    }
+  }
+}
+
+void solenoid_test_callback(void)
+{
+  if ((long)(millis() - solenoid_test_until) >= 0) {
+    solenoid_test.disable();
+    if (!panels_going_down) {
+      turn_off_solenoid_power_supply();
+      out.println(F("# solenoid test over, DO2 off"));
+    }
+  }
 }
 
 void mark_firmware_good_callback(void)

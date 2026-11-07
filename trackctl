@@ -10,6 +10,8 @@
   trackctl up | down | stop   one lift (5 s at most, all limits apply), let the panels down, stop both outputs
   trackctl cal [down|up|clear] tilt calibration: down with the panels resting at the bottom, then up at the
                               top stop (saved in flash); plain `cal` shows it
+  trackctl motor on|off       DO1 on for at most 5 s (the motor supply), for wiring checks
+  trackctl solenoid on|off    DO2 on for at most 60 s, for wiring checks
   trackctl upload on|off      stream telemetry to bedichek.org (kept across restarts)
   trackctl telemetry | reboot
 
@@ -173,6 +175,8 @@ def main():
         command(f"upload {args[1]}")
     elif cmd == "cal" and len(args) <= 2 and (len(args) == 1 or args[1] in ("down", "up", "clear")):
         command(" ".join(args))
+    elif cmd in ("motor", "solenoid") and len(args) == 2 and args[1] in ("on", "off"):
+        command(f"{cmd} {args[1]}")
     elif cmd in ("up", "down", "stop", "telemetry", "reboot"):
         command(cmd)
     else:
