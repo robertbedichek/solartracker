@@ -145,6 +145,10 @@ const float pv_raise_threshold = 1.0;
 // Longest single lift (was 5 s on the Arduino; 8 s from 2026-11-08, Rob)
 const unsigned long max_raise_ms = 8000UL;
 const unsigned long stall_grace_ms = 2000UL;  // Rob, 2026-11-08
+// Stop a lift this far before the upper limit, for the reading's lag and the panels' coasting: the first full lift
+// (2026-11-08, about 8.5 deg/s) stopped 1.5 deg past the threshold and coasted another 2.9 deg, to 0.9 deg below the
+// top stop.  Rob, 2026-11-08.
+const float lift_stop_lead_deg = 4.0;
 
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 90;
@@ -242,6 +246,8 @@ void check_outputs_callback(void);
 Task check_outputs(TASK_SECOND * 10, TASK_FOREVER, &check_outputs_callback, &ts, true);
 void sync_rtc_callback(void);
 Task sync_rtc(TASK_SECOND, TASK_FOREVER, &sync_rtc_callback, &ts, true);
+void run_record_callback(void);
+Task run_record(500, TASK_FOREVER, &run_record_callback, &ts, true);
 void pendant_callback(void);
 Task pendant(50, TASK_FOREVER, &pendant_callback, &ts, true);
 void solenoid_test_callback(void);
@@ -517,6 +523,20 @@ static bool incl_read(int16_t regs[INCL_REGS])
   return true;
 }
 
+// 10 Hz history for the motor-run record: the last RUN_RING bus cycles (90 s), in PSRAM.  After each motor run the
+// samples from 3 s before the motor started to 5 s after it stopped are written out as "#RUN" / "#RS" lines.
+#define RUN_RING (900)
+struct Run_Sample {
+  uint32_t ms;
+  uint16_t motor_mv, pv_mv;
+  int16_t acc[3], gyro[3], roll;
+  uint8_t flags;                              // 1 analog ok, 2 inclinometer ok, 4 motor on, 8 solenoid on
+};
+Run_Sample *run_ring;
+uint32_t run_count;                           // Samples written so far (under bus_lock)
+bool motor_power_supply_is_on_for_bus(void);
+bool solenoid_on_for_bus(void);
+
 void bus_task(void *arg)
 {
   bool mode_set = false;
@@ -572,6 +592,19 @@ void bus_task(void *arg)
       }
     } else if (++bus.incl_failures >= 5) {   // Half a second without an answer
       bus.incl_ok = false;
+    }
+    if (run_ring) {
+      Run_Sample &r = run_ring[run_count % RUN_RING];
+      r.ms = millis();
+      r.motor_mv = ok ? mv[MOTOR_CURRENT_CHANNEL] : 0;
+      r.pv_mv = ok ? mv[PV_CURRENT_CHANNEL] : 0;
+      for (int i = 0; i < 3; i++) {
+        r.acc[i] = iok ? regs[i] : 0;
+        r.gyro[i] = iok ? regs[3 + i] : 0;
+      }
+      r.roll = iok ? regs[9] : 0;
+      r.flags = (ok ? 1 : 0) | (iok ? 2 : 0) | (motor_power_supply_is_on_for_bus() ? 4 : 0) | (solenoid_on_for_bus() ? 8 : 0);
+      run_count++;
     }
     portEXIT_CRITICAL(&bus_lock);
     if ((int32_t)(xTaskGetTickCount() - wake) > 0) {
@@ -797,6 +830,14 @@ void set_calvals_to_defaults() {
 unsigned long motor_run_start;
 float motor_run_start_pos;
 bool motor_run_start_known;
+// The 10 Hz record of the latest run: written 5 s after the motor stops.  A run that starts again within those 5 s
+// is merged into the same record.
+bool run_record_pending;
+unsigned long run_record_start, run_record_end;
+struct timeval run_record_start_tv;
+
+bool motor_power_supply_is_on_for_bus(void) { return motor_power_supply_is_on; }
+bool solenoid_on_for_bus(void) { return solenoid_power_supply_is_on; }
 
 void turn_on_motor_power_supply(void)
 {
@@ -808,6 +849,11 @@ void turn_on_motor_power_supply(void)
     motor_run_start = millis();
     motor_run_start_pos = position_sensor_val;
     motor_run_start_known = position_fresh;
+    if (!run_record_pending) {
+      run_record_start = motor_run_start;
+      gettimeofday(&run_record_start_tv, nullptr);
+    }
+    run_record_pending = false;           // Until the motor stops again
   }
   if (outputs) outputs->on(MOTOR_PS_OUTPUT);
   motor_power_supply_is_on = true;
@@ -830,6 +876,8 @@ void turn_off_motor_power_supply(void)
     }
     out.printf("# motor run: %.1f s, %s, peak motor %.0f A, peak shake %.0f mg, peak rotation %.2f deg/s\n",
                (millis() - motor_run_start) / 1000.0, moved, dev / 20.0, shake, gyro);
+    run_record_end = millis();
+    run_record_pending = true;
   }
 }
 
@@ -1115,7 +1163,7 @@ void monitor_position_limits_callback()
   if (panels_going_up && (millis() - last_drive_panels_up_time) > max_raise_ms) {
     stop_driving_panels("8 s raise limit");
   }
-  if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + from_counts(5))) {
+  if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + from_counts(5) - lift_stop_lead_deg)) {
     stop_driving_panels("upper limit reached");
   }
   if (panels_going_down) {
@@ -2018,6 +2066,56 @@ void motor_test_callback(void)
   }
 }
 
+// Writes the latest motor run's 10 Hz record:
+//   #RUN <date> <time.ms of motor start> <motor-on seconds> <samples>
+//   #RS <s from motor start> <motor on> <motor A> <PV A> <roll> <ax> <ay> <az> (g) <gx> <gy> <gz> (deg/s)
+// "-" where a device didn't answer.  The web page plots the latest record.
+void run_record_callback(void)
+{
+  if (!run_record_pending || motor_power_supply_is_on || millis() - run_record_end < 5000 || !run_ring) {
+    return;
+  }
+  run_record_pending = false;
+  static Run_Sample copy[RUN_RING];
+  uint32_t n, count;
+  portENTER_CRITICAL(&bus_lock);
+  count = run_count;
+  n = count < RUN_RING ? count : RUN_RING;
+  for (uint32_t i = 0; i < n; i++) {
+    copy[i] = run_ring[(count - n + i) % RUN_RING];
+  }
+  portEXIT_CRITICAL(&bus_lock);
+  uint32_t from = run_record_start - 3000, to = run_record_end + 5000;
+  int first = -1, last = -1;
+  for (uint32_t i = 0; i < n; i++) {
+    if ((int32_t)(copy[i].ms - from) >= 0 && (int32_t)(to - copy[i].ms) >= 0) {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) {
+    return;
+  }
+  struct tm tm;
+  localtime_r(&run_record_start_tv.tv_sec, &tm);
+  out.printf("#RUN %4u-%02u-%02u %02u:%02u:%02u.%03u %.1f %d\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, (unsigned)(run_record_start_tv.tv_usec / 1000),
+             (run_record_end - run_record_start) / 1000.0, last - first + 1);
+  for (int i = first; i <= last; i++) {
+    const Run_Sample &r = copy[i];
+    char a[32] = "- -", inc[96] = "- - - - - - -";
+    if (r.flags & 1) {
+      snprintf(a, sizeof(a), "%.1f %.2f", fabsf(r.motor_mv - motor_zero_mv) / 20.0, fabsf(r.pv_mv - pv_zero_mv) / 200.0);
+    }
+    if (r.flags & 2) {
+      snprintf(inc, sizeof(inc), "%.2f %.3f %.3f %.3f %.2f %.2f %.2f", r.roll / 32768.0 * 180.0,
+               r.acc[0] / 32768.0 * 16.0, r.acc[1] / 32768.0 * 16.0, r.acc[2] / 32768.0 * 16.0,
+               r.gyro[0] / 32768.0 * 2000.0, r.gyro[1] / 32768.0 * 2000.0, r.gyro[2] / 32768.0 * 2000.0);
+    }
+    out.printf("#RS %.3f %d %s %s\n", ((int32_t)(r.ms - run_record_start)) / 1000.0, (r.flags & 4) ? 1 : 0, a, inc);
+  }
+}
+
 void pendant_callback(void)
 {
   static uint8_t up_count, down_count;     // Consecutive 50 ms polls with the button closed
@@ -2208,6 +2306,7 @@ void setup(void)
   RS485.begin(BUS_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
   RS485.setPins(-1, -1, -1, RS485_DE_PIN);
   RS485.setMode(UART_MODE_RS485_HALF_DUPLEX);
+  run_ring = (Run_Sample *)(psramFound() ? ps_malloc(sizeof(Run_Sample) * RUN_RING) : malloc(sizeof(Run_Sample) * RUN_RING));
   xTaskCreatePinnedToCore(bus_task, "rs485", 4096, nullptr, 2, nullptr, 0);
 
   setup_time();
