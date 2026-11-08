@@ -1069,7 +1069,10 @@ float pv_current(void)
    The telemetry line, in the Arduino's format (Pos now in degrees above rest; "PV Amps" is now one column, PVAmps,
    so the header names line up), then every inclinometer value: acceleration (g), rotation rate (deg/s),
    magnetometer (raw), roll, pitch, yaw (deg), its temperature (C), and since the previous line the peak shake
-   (mg, total acceleration against its running average) and peak rotation rate (deg/s), for wind.  "-" when it isn't answering.  Arduino-era line:
+   (mg, total acceleration against its running average) and peak rotation rate (deg/s), for wind.  "-" when it isn't answering.
+   Pos, UpL and Dnl are "-" without an inclinometer reading, and Amps and PVAmps without the analog module: after each
+   restart the first line used to come before either had answered and showed 0.0 A PV and 0.0 deg (2026-11-08).
+   The first line after a restart waits up to 30 s for both.  Arduino-era line:
 
   2025-04-06 01:01:07 1   58    0    0    0  328  11.534   0   0   1   0   1   0   0   0   0  0.0
 */
@@ -1089,9 +1092,19 @@ void emit_telemetry_callback(void)
   static float last_pv_current;
   static int last_force_telemetry;
   static int skipped_record_counter = 0;
+  static unsigned long first_line_wait_start;
 
   if (!time_valid) {
     return;   // Lines without a real date would land in the wrong place on the graphs
+  }
+  bool have_analog = analog_ok(), have_position = position_known();
+  if (last_operation_mode == last_mode && !(have_analog && have_position)) {   // No line yet since the restart
+    if (first_line_wait_start == 0) {
+      first_line_wait_start = millis();
+    }
+    if (millis() - first_line_wait_start < 30 * 1000UL) {
+      return;   // Give the sensors a moment to answer; after 30 s the line goes out with "-" for what's missing
+    }
   }
 
   int cur_motor_amps = motor_amps();
@@ -1130,8 +1143,23 @@ void emit_telemetry_callback(void)
     }
 
     time_t t = now();
-    char pv[12];
-    dtostrf(last_pv_current, 4, 1, pv);
+    char pv[12], pos[12], amps[12], upl[4], dnl[4];
+    if (have_analog) {
+      dtostrf(last_pv_current, 4, 1, pv);
+      snprintf(amps, sizeof(amps), "%d", cur_motor_amps);
+    } else {
+      strcpy(pv, "-");
+      strcpy(amps, "-");
+    }
+    if (have_position) {
+      snprintf(pos, sizeof(pos), "%.1f", position_sensor_val);
+      snprintf(upl, sizeof(upl), "%d", at_upper_position_limit);
+      snprintf(dnl, sizeof(dnl), "%d", at_lower_position_limit);
+    } else {
+      strcpy(pos, "-");
+      strcpy(upl, "-");
+      strcpy(dnl, "-");
+    }
     Incl incl = inclinometer();
     float peak_shake, peak_gyro;
     portENTER_CRITICAL(&bus_lock);
@@ -1148,10 +1176,10 @@ void emit_telemetry_callback(void)
     } else {
       strcpy(iv, "     -      -      -       -       -       -     -     -     -       -       -       -     -     -     -");
     }
-    out.printf("%4u-%02u-%02u %02u:%02u:%02u %d %5.1f %4d %3d %3d %3d %3d %3d %3d %3d %6s %s\n",
+    out.printf("%4u-%02u-%02u %02u:%02u:%02u %d %5s %4s %3s %3s %3d %3d %3d %3d %3d %6s %s\n",
                year(t), month(t), day(t), hour(t), minute(t), second(t),
-               calvals.operation_mode, position_sensor_val, cur_motor_amps,
-               at_upper_position_limit, at_lower_position_limit, panels_going_up, panels_going_down,
+               calvals.operation_mode, pos, amps,
+               upl, dnl, panels_going_up, panels_going_down,
                solenoid_power_supply_is_on, motor_power_supply_is_on, lower_panel_request,
                pv, iv);
   }
