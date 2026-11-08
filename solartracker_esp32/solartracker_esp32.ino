@@ -19,7 +19,7 @@
      bottom) and "cal up" (panels at the top stop) measure it on the frame, and the Arduino's limits, which were
      in draw-wire counts (rest about 50, top stop about 363), become the same fractions of that travel.  Until
      both are done the panels never move.  If the inclinometer stops answering while they move, they carry on:
-     the top limit switch cuts the motor supply SSR, and the 5 s lift limit and current checks still apply.
+     the top limit switch cuts the motor supply SSR, and the 8 s lift limit and current checks still apply.
    - Analog CH1 is the motor current Hall sensor (was A1), CH2 the PV current Hall sensor (was A2), read in
      millivolts.
    - Time comes from NTP and is kept in the RTC; the 'd' and 't' console commands are gone.
@@ -138,6 +138,14 @@ unsigned long solenoid_power_supply_on_off_time;  // Value of millis() when we l
 unsigned long last_drive_panels_up_time;
 
 
+// PV current above which it's sunny enough to raise the panels (and to start a new day).  Was 3 A on the Arduino;
+// 1 A from 2026-11-08 (Rob), since late-autumn days peak around 3 A.
+const float pv_raise_threshold = 1.0;
+
+// Longest single lift (was 5 s on the Arduino; 8 s from 2026-11-08, Rob)
+const unsigned long max_raise_ms = 8000UL;
+const unsigned long stall_grace_ms = 2000UL;  // Rob, 2026-11-08
+
 const unsigned motor_current_threshold_low = 10;
 const unsigned motor_current_threshold_high = 90;
 
@@ -213,6 +221,8 @@ const unsigned long pendant_down_max = 12 * 3600 * 1000UL;
 const float pendant_rest_deg = 0.5;          // Less tilt change than this in a 30-min solenoid-on period = resting
 float pendant_on_angles[2];                  // Tilt when the current solenoid-on period began
 bool pendant_on_angles_valid;
+bool uncal_lowered_tonight;                  // The automatic uncalibrated lowering has run since the PV was last high
+void start_uncalibrated_lowering(const char *why);
 bool motor_power_supply_is_on = false;
 bool solenoid_power_supply_is_on = false;
 
@@ -239,7 +249,7 @@ Task solenoid_test(TASK_SECOND, TASK_FOREVER, &solenoid_test_callback, &ts, fals
 unsigned long solenoid_test_until;
 void motor_test_callback(void);
 Task motor_test(100, TASK_FOREVER, &motor_test_callback, &ts, false);
-unsigned long motor_test_until;        // "motor on" from trackctl: DO1 on for at most 5 s (a lift's limit), for wiring checks     // "solenoid on" from trackctl: DO2 on for a limited time, for wiring checks
+unsigned long motor_test_until;        // "motor on" from trackctl: DO1 on for at most 5 s , for wiring checks     // "solenoid on" from trackctl: DO2 on for a limited time, for wiring checks
 void mark_firmware_good_callback(void);
 Task mark_firmware_good(TASK_SECOND * 60, TASK_ONCE, &mark_firmware_good_callback, &ts, false);
 
@@ -390,6 +400,11 @@ struct Bus_Data {
   bool incl_ok;
   uint32_t incl_failures;                     // Consecutive failed inclinometer reads
   uint32_t incl_reads;
+  float acc_mean_g;                           // Slow running average of |acceleration| (the sensor's static reading)
+  float peak_shake_mg;                        // Largest | |a| - acc_mean_g | since the last telemetry line
+  float peak_gyro_dps;                        // Largest rotation-rate magnitude since the last telemetry line
+  bool rec;                                   // The motor is on: also record peaks over the whole run
+  float rec_shake_mg, rec_gyro_dps, rec_motor_dev_mv;
 } bus;
 portMUX_TYPE bus_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -521,6 +536,10 @@ void bus_task(void *arg)
       }
       bus.count++;
       bus.analog_failures = 0;
+      if (bus.rec) {
+        float dev = fabsf(mv[MOTOR_CURRENT_CHANNEL] - motor_zero_mv);
+        if (dev > bus.rec_motor_dev_mv) bus.rec_motor_dev_mv = dev;
+      }
     } else {
       bus.analog_failures++;
     }
@@ -537,6 +556,20 @@ void bus_task(void *arg)
       bus.incl_ok = true;
       bus.incl_failures = 0;
       bus.incl_reads++;
+      // Wind and vibration: total acceleration against its slow average (about a minute at 10 readings a second;
+      // the average removes the sensor's fixed offset, about 5 mg here), and the rotation-rate magnitude
+      float ax = regs[0] / 32768.0 * 16.0, ay = regs[1] / 32768.0 * 16.0, az = regs[2] / 32768.0 * 16.0;
+      float amag = sqrtf(ax * ax + ay * ay + az * az);
+      bus.acc_mean_g = bus.acc_mean_g == 0 ? amag : bus.acc_mean_g + (amag - bus.acc_mean_g) * 0.002f;
+      float shake = fabsf(amag - bus.acc_mean_g) * 1000.0f;
+      if (shake > bus.peak_shake_mg) bus.peak_shake_mg = shake;
+      float gx = regs[3] / 32768.0 * 2000.0, gy = regs[4] / 32768.0 * 2000.0, gz = regs[5] / 32768.0 * 2000.0;
+      float gmag = sqrtf(gx * gx + gy * gy + gz * gz);
+      if (gmag > bus.peak_gyro_dps) bus.peak_gyro_dps = gmag;
+      if (bus.rec) {
+        if (shake > bus.rec_shake_mg) bus.rec_shake_mg = shake;
+        if (gmag > bus.rec_gyro_dps) bus.rec_gyro_dps = gmag;
+      }
     } else if (++bus.incl_failures >= 5) {   // Half a second without an answer
       bus.incl_ok = false;
     }
@@ -758,16 +791,46 @@ void set_calvals_to_defaults() {
   load_calibration();                      // Sets the limits
 }
 
+// Each motor run (a lift, the pendant, or a test) is measured: peak shake and rotation rate from the inclinometer,
+// peak motor current, and how far the panels moved; a summary line is logged when the motor stops.  While the
+// panels go up, telemetry lines come every 200 ms with the shake and rotation peaks for each slice.
+unsigned long motor_run_start;
+float motor_run_start_pos;
+bool motor_run_start_known;
+
 void turn_on_motor_power_supply(void)
 {
+  if (!motor_power_supply_is_on) {
+    portENTER_CRITICAL(&bus_lock);
+    bus.rec = true;
+    bus.rec_shake_mg = bus.rec_gyro_dps = bus.rec_motor_dev_mv = 0;
+    portEXIT_CRITICAL(&bus_lock);
+    motor_run_start = millis();
+    motor_run_start_pos = position_sensor_val;
+    motor_run_start_known = position_fresh;
+  }
   if (outputs) outputs->on(MOTOR_PS_OUTPUT);
   motor_power_supply_is_on = true;
 }
 
 void turn_off_motor_power_supply(void)
 {
+  bool was_on = motor_power_supply_is_on;
   if (outputs) outputs->off(MOTOR_PS_OUTPUT);
   motor_power_supply_is_on = false;
+  if (was_on) {
+    portENTER_CRITICAL(&bus_lock);
+    bus.rec = false;
+    float shake = bus.rec_shake_mg, gyro = bus.rec_gyro_dps, dev = bus.rec_motor_dev_mv;
+    portEXIT_CRITICAL(&bus_lock);
+    char moved[48] = "tilt not known";
+    if (motor_run_start_known && position_fresh) {
+      snprintf(moved, sizeof(moved), "tilt %.2f -> %.2f deg (%+.2f)", motor_run_start_pos, position_sensor_val,
+               position_sensor_val - motor_run_start_pos);
+    }
+    out.printf("# motor run: %.1f s, %s, peak motor %.0f A, peak shake %.0f mg, peak rotation %.2f deg/s\n",
+               (millis() - motor_run_start) / 1000.0, moved, dev / 20.0, shake, gyro);
+  }
 }
 
 void turn_on_solenoid_power_supply(void)
@@ -878,7 +941,7 @@ void read_time_and_sensor_inputs_callback()
 
   // If the inclinometer stops answering while the panels move, they keep moving on the last position (Rob,
   // 2026-11-05): up is the only direction we drive, and the top limit switch cuts the motor supply SSR by itself.
-  // The 5 s lift limit and the motor current checks still apply; the stall check, which needs the position to
+  // The 8 s lift limit and the motor current checks still apply; the stall check, which needs the position to
   // rise, is skipped.  A move doesn't start without it.
   float tilt;
   position_fresh = panel_tilt(&tilt);
@@ -955,7 +1018,8 @@ float pv_current(void)
 /*
    The telemetry line, in the Arduino's format (Pos now in degrees above rest; "PV Amps" is now one column, PVAmps,
    so the header names line up), then every inclinometer value: acceleration (g), rotation rate (deg/s),
-   magnetometer (raw), roll, pitch, yaw (deg) and its temperature (C).  "-" when it isn't answering.  Arduino-era line:
+   magnetometer (raw), roll, pitch, yaw (deg), its temperature (C), and since the previous line the peak shake
+   (mg, total acceleration against its running average) and peak rotation rate (deg/s), for wind.  "-" when it isn't answering.  Arduino-era line:
 
   2025-04-06 01:01:07 1   58    0    0    0  328  11.534   0   0   1   0   1   0   0   0   0  0.0
 */
@@ -1009,7 +1073,7 @@ void emit_telemetry_callback(void)
     last_pv_current = pv_current();
     skipped_record_counter = at_lower_position_limit ? 900 : 180;
     if (line_counter == 0) {
-      out.println(F("# Date     Time     Md   Pos Amps UpL Dnl GUp GDn Sol Mot Low PVAmps  AccX   AccY   AccZ    GyrX    GyrY    GyrZ   MagX  MagY  MagZ    Roll   Pitch     Yaw  ITmp"));
+      out.println(F("# Date     Time     Md   Pos Amps UpL Dnl GUp GDn Sol Mot Low PVAmps  AccX   AccY   AccZ    GyrX    GyrY    GyrZ   MagX  MagY  MagZ    Roll   Pitch     Yaw  ITmp Shake  Gyro"));
       line_counter = 20;
     } else {
       line_counter--;
@@ -1019,13 +1083,20 @@ void emit_telemetry_callback(void)
     char pv[12];
     dtostrf(last_pv_current, 4, 1, pv);
     Incl incl = inclinometer();
+    float peak_shake, peak_gyro;
+    portENTER_CRITICAL(&bus_lock);
+    peak_shake = bus.peak_shake_mg;
+    peak_gyro = bus.peak_gyro_dps;
+    bus.peak_shake_mg = 0;
+    bus.peak_gyro_dps = 0;
+    portEXIT_CRITICAL(&bus_lock);
     char iv[200] = "";
     if (incl.ok) {
-      snprintf(iv, sizeof(iv), "%6.3f %6.3f %6.3f %7.2f %7.2f %7.2f %5d %5d %5d %7.2f %7.2f %7.2f %5.2f",
+      snprintf(iv, sizeof(iv), "%6.3f %6.3f %6.3f %7.2f %7.2f %7.2f %5d %5d %5d %7.2f %7.2f %7.2f %5.2f %5.1f %5.2f",
                incl.acc_g[0], incl.acc_g[1], incl.acc_g[2], incl.gyro_dps[0], incl.gyro_dps[1], incl.gyro_dps[2],
-               incl.mag[0], incl.mag[1], incl.mag[2], incl.roll, incl.pitch, incl.yaw, incl.temp_c);
+               incl.mag[0], incl.mag[1], incl.mag[2], incl.roll, incl.pitch, incl.yaw, incl.temp_c, peak_shake, peak_gyro);
     } else {
-      strcpy(iv, "     -      -      -       -       -       -     -     -     -       -       -       -     -");
+      strcpy(iv, "     -      -      -       -       -       -     -     -     -       -       -       -     -     -     -");
     }
     out.printf("%4u-%02u-%02u %02u:%02u:%02u %d %5.1f %4d %3d %3d %3d %3d %3d %3d %3d %6s %s\n",
                year(t), month(t), day(t), hour(t), minute(t), second(t),
@@ -1041,8 +1112,8 @@ void emit_telemetry_callback(void)
 */
 void monitor_position_limits_callback()
 {
-  if (panels_going_up && (millis() - last_drive_panels_up_time) > 5000UL) {
-    stop_driving_panels("5s raise limit");
+  if (panels_going_up && (millis() - last_drive_panels_up_time) > max_raise_ms) {
+    stop_driving_panels("8 s raise limit");
   }
   if (panels_going_up && position_sensor_val > (calvals.position_upper_limit + from_counts(5))) {
     stop_driving_panels("upper limit reached");
@@ -1074,7 +1145,10 @@ void monitor_stall_and_motor_current_callback()
 {
   int amps = motor_amps();
   if (panels_going_up) {
-    if (position_fresh && amps > 1 && position_sensor_val <= last_position_sensor_val_stall + from_counts(0.5)) {
+    // No stall check for the first stall_grace_ms: the pump takes about a second to build pressure before the
+    // panels start to move (first lift 2026-11-08 stalled out at 1.2 s, then the panels rose 1.4 deg)
+    bool in_grace = millis() - last_drive_panels_up_time < stall_grace_ms;
+    if (!in_grace && position_fresh && amps > 1 && position_sensor_val <= last_position_sensor_val_stall + from_counts(0.5)) {
       if (stall_start_time == 0) {
         stall_start_time = millis();
       } else if ((millis() - stall_start_time) > 500) {
@@ -1139,7 +1213,7 @@ void drive_panels_to_desired_position(void)
 
   float pv = pv_current();
   bool pv_is_low = (pv < 0.2);
-  bool pv_is_high = pv > 3.0;
+  bool pv_is_high = pv > pv_raise_threshold;
   static bool new_day = true;
 
   // Dawn: when sun rises after a dark period and panels are down, reset daily stall count
@@ -1165,8 +1239,12 @@ void drive_panels_to_desired_position(void)
         first_high_pv_time = millis();
       } else {
         // Ensure that it has been at least 30 minutes since the last time we attempted to raise the panels and that
-        // it has been at least 60 minutes since the start of generating more than 3 amps of panel current in the new day.
-        bool sufficient_delay = ((millis() - last_drive_panels_up_time) >  30UL * 60 * 1000) && ((millis() - first_high_pv_time) > 60UL * 60 * 1000);
+        // it has been at least 60 minutes since the PV current first exceeded pv_raise_threshold in the new day.
+        // Within an hour of a restart the 60-minute wait is skipped (Rob, 2026-11-08), and "no lift since boot"
+        // doesn't count as a recent lift.
+        bool recent_lift = last_drive_panels_up_time != 0 && (millis() - last_drive_panels_up_time) <= 30UL * 60 * 1000;
+        bool sunny_long_enough = millis() < 60UL * 60 * 1000 || (millis() - first_high_pv_time) > 60UL * 60 * 1000;
+        bool sufficient_delay = !recent_lift && sunny_long_enough;
         if (daily_stalls < 5 && sufficient_delay && !at_upper_position_limit) {
           drive_panels_up();
         }
@@ -1175,9 +1253,46 @@ void drive_panels_to_desired_position(void)
   }
 }
 
+// Lowering before calibration (pendant DOWN, or automatically at dusk): the solenoid's 30 min on / 45 off cycle until
+// the tilt shows the panels resting, 8 AM, or 12 hours; see pendant_callback, which runs the cycle.
+void start_uncalibrated_lowering(const char *why)
+{
+  turn_on_solenoid_power_supply();
+  pendant_lowering = true;
+  pendant_since = millis();
+  pendant_on_angles_valid = incl_angles(pendant_on_angles);
+  force_telemetry++;
+  out.printf("# %s (not calibrated): lowering, solenoid 30 min on / 45 off until the panels rest\n", why);
+}
+
+// Before calibration, in track mode, the panels are still let down at dusk (PV under 0.2 A for 45 min), once per
+// night.  They are not raised until calibration is done.
+void uncalibrated_dusk_lowering(void)
+{
+  static unsigned long low_pv_start_time;
+  float pv = pv_current();
+  if (pv > pv_raise_threshold) {
+    uncal_lowered_tonight = false;      // Daytime: allow tonight's lowering
+  }
+  if (pv >= 0.2) {
+    low_pv_start_time = 0;
+  } else if (low_pv_start_time == 0) {
+    low_pv_start_time = millis();
+  } else if (millis() - low_pv_start_time > 45UL * 60 * 1000 && !uncal_lowered_tonight && hour(now()) != 8) {
+    uncal_lowered_tonight = true;
+    start_uncalibrated_lowering("pv low 45 min");
+  }
+}
+
 void control_hydraulics_callback()
 {
-  if (failed || !analog_ok() || !position_known() || pendant_raising || pendant_lowering || pendant_up || pendant_down) {
+  if (failed || !analog_ok() || pendant_raising || pendant_lowering || pendant_up || pendant_down) {
+    return;
+  }
+  if (!position_known()) {
+    if (calvals.operation_mode == position_mode && !panels_going_up && !panels_going_down && !motor_power_supply_is_on) {
+      uncalibrated_dusk_lowering();
+    }
     return;
   }
   if (!panels_going_up && !panels_going_down) {
@@ -1203,7 +1318,7 @@ void control_hydraulics_callback()
 /*****************************************************************************************************/
 // Commands, from the USB serial console or from trackctl (POST /cmd).  One per line:
 //   mode off|track       off: report but never move by itself; track: the normal mode (saved in flash)
-//   up                   one lift, with all the usual limits (5 s at most)
+//   up                   one lift, with all the usual limits (8 s at most)
 //   down                 let the panels down (solenoid), until the lower limit or 8 AM
 //   stop                 both outputs off now
 //   zero [motor|pv]      record a current sensor's no-current output (motor off / PV at night), saved in flash
@@ -1640,7 +1755,7 @@ void handle_status(void)
        ", \"outputs\": \"0x" + String(outputs ? outputs->all() : 0, HEX) + "\",\n";
   s += "  \"pendant_up\": " + String(pendant_up) + ", \"pendant_down\": " + String(pendant_down) +
        ", \"pendant_raising\": " + String(pendant_raising) + ", \"pendant_lowering\": " + String(pendant_lowering) +
-       ", \"cal_have_up\": " + String(tcal.have_up) + ", \"cal_have_down\": " + String(tcal.have_down) + ",\n";
+       ", \"uncal_lowered_tonight\": " + String(uncal_lowered_tonight) + ", \"cal_have_up\": " + String(tcal.have_up) + ", \"cal_have_down\": " + String(tcal.have_down) + ",\n";
   s += "  \"lower_request\": " + String(lower_panel_request) + ", \"daily_stalls\": " + String(daily_stalls) + ",\n";
   s += "  \"motor_amps\": " + String(motor_amps()) + ", \"pv_amps\": " + f(pv_current(), 2) +
        ", \"motor_zero_mv\": " + f(motor_zero_mv, 0) + ", \"pv_zero_mv\": " + f(pv_zero_mv, 0) + ",\n";
@@ -1973,11 +2088,7 @@ void pendant_callback(void)
         drive_panels_down("pendant");
       }
     } else {
-      turn_on_solenoid_power_supply();
-      pendant_lowering = true;
-      pendant_since = millis();
-      pendant_on_angles_valid = incl_angles(pendant_on_angles);
-      out.println(F("# pendant DOWN (not calibrated): lowering, solenoid 30 min on / 45 off until the panels rest"));
+      start_uncalibrated_lowering("pendant DOWN");
     }
   } else if (pendant_lowering) {
     static unsigned long last_check;

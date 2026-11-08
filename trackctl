@@ -7,7 +7,7 @@
   trackctl status             the controller's state (JSON; the page at http://solartracker/ shows it)
   trackctl log [-f] [BYTES]   recent output; -f keeps following it
   trackctl mode off|track     off: never moves by itself; track: normal (saved in flash)
-  trackctl up | down | stop   one lift (5 s at most, all limits apply), let the panels down, stop both outputs
+  trackctl up | down | stop   one lift (8 s at most, all limits apply), let the panels down, stop both outputs
   trackctl cal [down|up|clear] tilt calibration: down with the panels resting at the bottom, then up at the
                               top stop (saved in flash); plain `cal` shows it
   trackctl motor on|off       DO1 on for at most 5 s (the motor supply), for wiring checks
