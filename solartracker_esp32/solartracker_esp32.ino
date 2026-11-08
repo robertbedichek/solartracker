@@ -384,8 +384,9 @@ int year(time_t t)        { return tm_of(t).tm_year + 1900; }
 
 /*****************************************************************************************************/
 // RS485 bus: the analog module (address 1) and the inclinometer (0x50) share it, 9600 8N1.  A FreeRTOS task
-// owns the bus: every 100 ms it reads the analog module (about 30 ms) and the inclinometer (about 60 ms), and
-// leaves the readings here for the control tasks.
+// owns the bus: it reads the analog module and then the inclinometer, and leaves the readings here for the control
+// tasks.  It's scheduled every 100 ms, but the two exchanges take about 190 ms at 9600 baud, so in practice it runs
+// back to back at about 5.2 cycles a second (measured 2026-11-08: 49,764 reads in 9,594 s, no errors).
 
 #define ANALOG_MODBUS_ADDR   (1)
 #define INCL_MODBUS_ADDR     (0x50)
@@ -523,7 +524,8 @@ static bool incl_read(int16_t regs[INCL_REGS])
   return true;
 }
 
-// 10 Hz history for the motor-run record: the last RUN_RING bus cycles (90 s), in PSRAM.  After each motor run the
+// History for the motor-run record, one sample per bus cycle (about 5 a second): the last RUN_RING cycles (about
+// 3 minutes), in PSRAM.  After each motor run the
 // samples from 3 s before the motor started to 5 s after it stopped are written out as "#RUN" / "#RS" lines.
 #define RUN_RING (900)
 struct Run_Sample {
@@ -590,7 +592,7 @@ void bus_task(void *arg)
         if (shake > bus.rec_shake_mg) bus.rec_shake_mg = shake;
         if (gmag > bus.rec_gyro_dps) bus.rec_gyro_dps = gmag;
       }
-    } else if (++bus.incl_failures >= 5) {   // Half a second without an answer
+    } else if (++bus.incl_failures >= 5) {   // About a second without an answer (5 bus cycles)
       bus.incl_ok = false;
     }
     if (run_ring) {
@@ -830,7 +832,7 @@ void set_calvals_to_defaults() {
 unsigned long motor_run_start;
 float motor_run_start_pos;
 bool motor_run_start_known;
-// The 10 Hz record of the latest run: written 5 s after the motor stops.  A run that starts again within those 5 s
+// The per-bus-cycle record of the latest run: written 5 s after the motor stops.  A run that starts again within those 5 s
 // is merged into the same record.
 bool run_record_pending;
 unsigned long run_record_start, run_record_end;
@@ -980,7 +982,7 @@ void drive_panels_down(const char *why)
 
 /*
    Reads the sensors and deposits the results in the globals above.  Every second, or every 100 ms while the panels
-   move.  The position is the inclinometer's tilt (mean of its last two readings, 100 ms apart).  The analog
+   move.  The position is the inclinometer's tilt (mean of its last two readings, one bus cycle, about 190 ms, apart).  The analog
    module is still required while moving: without the motor current there's no over-current stop.
 */
 void read_time_and_sensor_inputs_callback()
@@ -2066,7 +2068,7 @@ void motor_test_callback(void)
   }
 }
 
-// Writes the latest motor run's 10 Hz record:
+// Writes the latest motor run's record (one sample per bus cycle, about 5 a second):
 //   #RUN <date> <time.ms of motor start> <motor-on seconds> <samples>
 //   #RS <s from motor start> <motor on> <motor A> <PV A> <roll> <ax> <ay> <az> (g) <gx> <gy> <gz> (deg/s)
 // "-" where a device didn't answer.  The web page plots the latest record.
